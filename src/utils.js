@@ -41,6 +41,35 @@ function normalizeDowToken(t) {
   return null;
 }
 
+function normalizeRepeatDays(input) {
+  const map = {
+    mon: "mon", monday: "mon",
+    tue: "tue", tues: "tue", tuesday: "tue",
+    wed: "wed", wednesday: "wed",
+    thu: "thu", thur: "thu", thurs: "thu", thursday: "thu",
+    fri: "fri", friday: "fri",
+    sat: "sat", saturday: "sat",
+    sun: "sun", sunday: "sun",
+  };
+
+  const raw = String(input || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .split(",")
+    .filter(Boolean);
+
+  const out = [];
+  for (const token of raw) {
+    const v = map[token];
+    if (v && !out.includes(v)) out.push(v);
+  }
+
+  // canonical order
+  const order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+  out.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  return out;
+}
+
 function parseRepeatDays(daysStr) {
   const toks = String(daysStr || "")
     .split(",")
@@ -201,5 +230,6 @@ module.exports = {
   parseYYYYMMDD,
   parseHHMM,
   zonedDateTimeToUtcMs,
-  parseStartInput
+  parseStartInput,
+  normalizeRepeatDays,
 };
