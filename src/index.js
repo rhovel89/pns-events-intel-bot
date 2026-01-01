@@ -230,7 +230,7 @@ async function createTemplate({ guildId, name, dateYmd, timeHhmm, timeZone, repe
 
   const ins = await query(
     `INSERT INTO recurring_templates
-      (guild_id, name, time_hhmm, tz, repeat_days, weeks_ahead, notes, created_by, active, created_ts)
+      (guild_id, name, time_hhmm, tz, repeat_days, weeks_ahead, notes, created_by, is_enabled, created_ts)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)
      RETURNING *;`,
     [
@@ -274,7 +274,7 @@ async function listTemplates(guildId) {
 
 async function disableTemplate(guildId, templateId) {
   await query(
-    `UPDATE recurring_templates SET active = FALSE WHERE id = $1 AND guild_id = $2;`,
+    `UPDATE recurring_templates SET is_enabled = FALSE WHERE id = $1 AND guild_id = $2;`,
     [String(templateId), guildId]
   );
 }
@@ -425,7 +425,7 @@ async function topUpRecurringTemplates() {
   const guilds = client.guilds.cache.map(g => g.id);
   for (const guildId of guilds) {
     const tRes = await query(
-      `SELECT * FROM recurring_templates WHERE guild_id = $1 AND active = TRUE;`,
+      `SELECT * FROM recurring_templates WHERE guild_id = $1 AND is_enabled = TRUE;`,
       [guildId]
     );
     if (!tRes.rows.length) continue;
@@ -519,8 +519,8 @@ client.on("interactionCreate", async interaction => {
           if (!rows.length) return interaction.editReply("No recurring templates found.");
 
           const lines = rows.map(t => {
-            const active = t.active ? "ACTIVE" : "DISABLED";
-            return `**#${t.id}** • ${t.name} • ${t.repeat_days.toUpperCase()} @ ${t.time_hhmm} (${t.tz}) • weeks_ahead=${t.weeks_ahead} • ${active}`;
+            const is_enabled = t.is_enabled ? "ACTIVE" : "DISABLED";
+            return `**#${t.id}** • ${t.name} • ${t.repeat_days.toUpperCase()} @ ${t.time_hhmm} (${t.tz}) • weeks_ahead=${t.weeks_ahead} • ${is_enabled}`;
           });
 
           return interaction.editReply(lines.join("\n"));
@@ -643,7 +643,7 @@ client.on("interactionCreate", async interaction => {
         await interaction.deferReply({ ephemeral: true });
 
         const rows = await listActiveEvents(guildId, 20);
-        if (!rows.length) return interaction.editReply("No active events.");
+        if (!rows.length) return interaction.editReply("No is_enabled events.");
 
         const lines = rows.map(r => `**#${r.id}** • ${r.name} • ${fmtStartBoth(Number(r.start_ts))}`);
         return interaction.editReply(lines.join("\n"));
@@ -667,7 +667,7 @@ client.on("interactionCreate", async interaction => {
         const choice = interaction.options.getString("choice", true);
 
         const row = await getEventById(eventId);
-        if (!row || row.status !== "ACTIVE") return interaction.editReply("Event not found or not active.");
+        if (!row || row.status !== "ACTIVE") return interaction.editReply("Event not found or not is_enabled.");
 
         await upsertRsvp(eventId, interaction.user.id, choice);
         await updateEventMessage(eventId);
@@ -763,7 +763,7 @@ client.on("interactionCreate", async interaction => {
       }
     }
 
-    if (interaction.commandName === "inactive") {
+    if (interaction.commandName === "inis_enabled") {
       const sub = interaction.options.getSubcommand(true);
       const guildId = interaction.guildId;
       if (!guildId) return;
@@ -789,18 +789,18 @@ client.on("interactionCreate", async interaction => {
         const guild = interaction.guild;
         await guild.members.fetch().catch(() => null);
 
-        const inactive = [];
+        const inis_enabled = [];
         for (const [, m] of guild.members.cache) {
           if (m.user.bot) continue;
           const last = lastMap.get(m.id);
-          if (!last || last < cutoff) inactive.push(m.id);
+          if (!last || last < cutoff) inis_enabled.push(m.id);
         }
 
-        if (!inactive.length) return interaction.editReply(`No members are inactive by check-ins (>${days} days).`);
+        if (!inis_enabled.length) return interaction.editReply(`No members are inis_enabled by check-ins (>${days} days).`);
 
-        const list = inactive.slice(0, 40).map(id => `<@${id}>`).join(", ");
-        const more = inactive.length > 40 ? `\n…and ${inactive.length - 40} more.` : "";
-        return interaction.editReply(`Inactive (no check-in within **${days}** days):\n${list}${more}`);
+        const list = inis_enabled.slice(0, 40).map(id => `<@${id}>`).join(", ");
+        const more = inis_enabled.length > 40 ? `\n…and ${inis_enabled.length - 40} more.` : "";
+        return interaction.editReply(`Inis_enabled (no check-in within **${days}** days):\n${list}${more}`);
       }
     }
   } catch (err) {
