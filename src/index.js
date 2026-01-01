@@ -7,7 +7,7 @@ const {
   PermissionsBitField
 } = require("discord.js");
 const cron = require("node-cron");
-const db = require("./db");
+const { query, initDb } = require("./db");
 const {
   parseReminders,
   safeTruncate,
@@ -38,123 +38,145 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ---------- DB helpers ----------
-function createEvent({ guildId, channelId, name, startTs, notes, createdBy }) {
-  const info = db.prepare(`
-    INSERT INTO events (guild_id, channel_id, name, start_ts, notes, created_by, status, created_ts)
-    VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
-  `).run(guildId, channelId, name, startTs, notes || null, createdBy, Date.now());
+// ---------- DB helpers (Postgres) ----------
+async function createEvent({ guildId, channelId, name, startTs, notes, createdBy, reminders }) {
+  const createdTs = Date.now();
 
-  const eventId = info.lastInsertRowid;
+  const ins = await query(
+    `INSERT INTO events (guild_id, channel_id, name, start_ts, notes, created_by, status, created_ts)
+     VALUES ($1,$2,$3,$4,$5,$6,'ACTIVE',$7)
+     RETURNING *;`,
+    [guildId, channelId, name, String(startTs), notes || null, createdBy, String(createdTs)]
+  );
 
-  const ins = db.prepare(`
-    INSERT OR IGNORE INTO event_reminders (event_id, minutes_before, remind_ts, sent_ts)
-    VALUES (?, ?, ?, NULL)
-  `);
+  const eventRow = ins.rows[0];
 
-  for (const m of REMINDERS) {
+  // Insert reminders
+  for (const m of reminders) {
     const remindTs = startTs - m * 60 * 1000;
     if (remindTs > Date.now() - 60 * 1000) {
-      ins.run(eventId, m, remindTs);
+      await query(
+        `INSERT INTO event_reminders (event_id, minutes_before, remind_ts, sent_ts)
+         VALUES ($1,$2,$3,NULL)
+         ON CONFLICT (event_id, minutes_before) DO NOTHING;`,
+        [eventRow.id, m, String(remindTs)]
+      );
     }
   }
 
-  return getEventById(eventId);
+  return eventRow;
 }
 
-function getEventById(eventId) {
-  return db.prepare(`SELECT * FROM events WHERE id = ?`).get(eventId);
+async function getEventById(eventId) {
+  const res = await query(`SELECT * FROM events WHERE id = $1;`, [String(eventId)]);
+  return res.rows[0] || null;
 }
 
-function listActiveEvents(guildId, limit = 15) {
-  return db.prepare(`
-    SELECT * FROM events
-    WHERE guild_id = ? AND status = 'ACTIVE'
-    ORDER BY start_ts ASC
-    LIMIT ?
-  `).all(guildId, limit);
+async function listActiveEvents(guildId, limit = 15) {
+  const res = await query(
+    `SELECT * FROM events
+     WHERE guild_id = $1 AND status = 'ACTIVE'
+     ORDER BY start_ts ASC
+     LIMIT $2;`,
+    [guildId, limit]
+  );
+  return res.rows;
 }
 
-function endEvent(guildId, eventId) {
-  const row = db.prepare(`SELECT * FROM events WHERE id = ? AND guild_id = ?`).get(eventId, guildId);
+async function endEvent(guildId, eventId) {
+  const rowRes = await query(
+    `SELECT * FROM events WHERE id = $1 AND guild_id = $2;`,
+    [String(eventId), guildId]
+  );
+  const row = rowRes.rows[0];
   if (!row) return { ok: false };
-  db.prepare(`UPDATE events SET status = 'ENDED' WHERE id = ?`).run(eventId);
+
+  await query(`UPDATE events SET status = 'ENDED' WHERE id = $1;`, [String(eventId)]);
   return { ok: true, row };
 }
 
-function upsertRsvp(eventId, userId, choice) {
-  db.prepare(`
-    INSERT INTO rsvps (event_id, user_id, choice, updated_ts)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(event_id, user_id) DO UPDATE SET
-      choice = excluded.choice,
-      updated_ts = excluded.updated_ts
-  `).run(eventId, userId, choice, Date.now());
+async function upsertRsvp(eventId, userId, choice) {
+  await query(
+    `INSERT INTO rsvps (event_id, user_id, choice, updated_ts)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (event_id, user_id) DO UPDATE SET
+       choice = EXCLUDED.choice,
+       updated_ts = EXCLUDED.updated_ts;`,
+    [String(eventId), userId, choice, String(Date.now())]
+  );
 }
 
-function getRsvpCounts(eventId) {
-  const rows = db.prepare(`
-    SELECT choice, COUNT(*) as count
-    FROM rsvps
-    WHERE event_id = ?
-    GROUP BY choice
-  `).all(eventId);
+async function getRsvpCounts(eventId) {
+  const res = await query(
+    `SELECT choice, COUNT(*)::int AS count
+     FROM rsvps
+     WHERE event_id = $1
+     GROUP BY choice;`,
+    [String(eventId)]
+  );
 
   const counts = { YES: 0, NO: 0, MAYBE: 0 };
-  for (const r of rows) counts[r.choice] = r.count;
+  for (const r of res.rows) counts[r.choice] = r.count;
   return counts;
 }
 
-function getRsvpLists(eventId) {
-  const rows = db.prepare(`
-    SELECT user_id, choice
-    FROM rsvps
-    WHERE event_id = ?
-  `).all(eventId);
+async function getRsvpLists(eventId) {
+  const res = await query(
+    `SELECT user_id, choice
+     FROM rsvps
+     WHERE event_id = $1;`,
+    [String(eventId)]
+  );
 
   const lists = { YES: [], NO: [], MAYBE: [] };
-  for (const r of rows) lists[r.choice]?.push(r.user_id);
+  for (const r of res.rows) lists[r.choice]?.push(r.user_id);
   return lists;
 }
 
 // Intel
-function addCheckin(guildId, userId) {
-  db.prepare("INSERT INTO checkins (guild_id, user_id, ts) VALUES (?, ?, ?)").run(
-    guildId, userId, Date.now()
+async function addCheckin(guildId, userId) {
+  await query(
+    `INSERT INTO checkins (guild_id, user_id, ts) VALUES ($1,$2,$3);`,
+    [guildId, userId, String(Date.now())]
   );
 }
 
-function leaderboard7d(guildId) {
+async function leaderboard7d(guildId) {
   const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  return db.prepare(`
-    SELECT user_id, COUNT(*) as cnt
-    FROM checkins
-    WHERE guild_id = ? AND ts >= ?
-    GROUP BY user_id
-    ORDER BY cnt DESC
-    LIMIT 20
-  `).all(guildId, since);
+  const res = await query(
+    `SELECT user_id, COUNT(*)::int AS cnt
+     FROM checkins
+     WHERE guild_id = $1 AND ts::bigint >= $2
+     GROUP BY user_id
+     ORDER BY cnt DESC
+     LIMIT 20;`,
+    [guildId, String(since)]
+  );
+  return res.rows;
 }
 
-function lastCheckinByUser(guildId) {
-  return db.prepare(`
-    SELECT user_id, MAX(ts) as last_ts
-    FROM checkins
-    WHERE guild_id = ?
-    GROUP BY user_id
-  `).all(guildId);
+async function lastCheckinByUser(guildId) {
+  const res = await query(
+    `SELECT user_id, MAX(ts)::bigint AS last_ts
+     FROM checkins
+     WHERE guild_id = $1
+     GROUP BY user_id;`,
+    [guildId]
+  );
+  return res.rows.map(r => ({ user_id: r.user_id, last_ts: Number(r.last_ts) }));
 }
 
 // ---------- Rendering ----------
 function eventEmbed(eventRow) {
-  const counts = getRsvpCounts(eventRow.id);
-  const lists = getRsvpLists(eventRow.id);
+async function eventEmbed(eventRow) {
+  const counts = await getRsvpCounts(eventRow.id);
+  const lists = await getRsvpLists(eventRow.id);
 
   const embed = new EmbedBuilder()
     .setTitle(`Event #${eventRow.id}: ${eventRow.name}`)
     .setDescription(
       [
-        `**Start**\n${fmtStartBoth(eventRow.start_ts)}`,
+        `**Start**\n${fmtStartBoth(Number(eventRow.start_ts))}`,
         eventRow.notes ? `**Notes:** ${safeTruncate(eventRow.notes, 800)}` : null,
         "",
         `**RSVPs:** ✅ Yes ${counts.YES} | ❔ Maybe ${counts.MAYBE} | ❌ No ${counts.NO}`,
@@ -165,13 +187,14 @@ function eventEmbed(eventRow) {
       ].filter(Boolean).join("\n")
     )
     .setFooter({ text: `Status: ${eventRow.status}` })
-    .setTimestamp(new Date(eventRow.created_ts));
+    .setTimestamp(new Date(Number(eventRow.created_ts)));
 
   return embed;
 }
 
+
 async function postEventMessage(eventRow) {
-  const channel = await client.channels.fetch(eventRow.channel_id).catch(() => null);
+  const msg = await channel.send({ embeds: [await eventEmbed(eventRow)] }).catch(() => null);
   if (!channel || !channel.isTextBased()) return null;
 
   const msg = await channel.send({ embeds: [eventEmbed(eventRow)] }).catch(() => null);
@@ -182,7 +205,7 @@ async function postEventMessage(eventRow) {
 }
 
 async function updateEventMessage(eventId) {
-  const eventRow = getEventById(eventId);
+  await msg.edit({ embeds: [await eventEmbed(eventRow)] }).catch(() => null);
   if (!eventRow || !eventRow.message_id) return;
 
   const channel = await client.channels.fetch(eventRow.channel_id).catch(() => null);
@@ -200,36 +223,40 @@ async function scanAndSendReminders() {
   const windowStart = now - 30 * 1000;
   const windowEnd = now + 30 * 1000;
 
-  const due = db.prepare(`
-    SELECT er.event_id, er.minutes_before, er.remind_ts,
-           e.channel_id, e.name, e.start_ts, e.status
-    FROM event_reminders er
-    JOIN events e ON e.id = er.event_id
-    WHERE er.sent_ts IS NULL
-      AND e.status = 'ACTIVE'
-      AND er.remind_ts BETWEEN ? AND ?
-    ORDER BY er.remind_ts ASC
-    LIMIT 25
-  `).all(windowStart, windowEnd);
+  const dueRes = await query(
+    `SELECT er.event_id, er.minutes_before, er.remind_ts,
+            e.channel_id, e.name, e.start_ts, e.status
+     FROM event_reminders er
+     JOIN events e ON e.id = er.event_id
+     WHERE er.sent_ts IS NULL
+       AND e.status = 'ACTIVE'
+       AND er.remind_ts::bigint BETWEEN $1 AND $2
+     ORDER BY er.remind_ts ASC
+     LIMIT 25;`,
+    [String(windowStart), String(windowEnd)]
+  );
 
-  for (const r of due) {
+  for (const r of dueRes.rows) {
     const channel = await client.channels.fetch(r.channel_id).catch(() => null);
     if (!channel || !channel.isTextBased()) continue;
+
+    const startTs = Number(r.start_ts);
 
     const embed = new EmbedBuilder()
       .setTitle(`Reminder: ${r.name} (Event #${r.event_id})`)
       .setDescription(
-        `Starts in **${r.minutes_before} min**.\n\n**Start**\n${fmtStartBoth(r.start_ts)}\n\nRSVP: \`/event rsvp event_id:${r.event_id}\``
+        `Starts in **${r.minutes_before} min**.\n\n**Start**\n${fmtStartBoth(startTs)}\n\nRSVP: \`/event rsvp event_id:${r.event_id}\``
       )
       .setTimestamp(new Date());
 
     const sent = await channel.send({ embeds: [embed] }).catch(() => null);
     if (sent) {
-      db.prepare(`
-        UPDATE event_reminders
-        SET sent_ts = ?
-        WHERE event_id = ? AND minutes_before = ?
-      `).run(Date.now(), r.event_id, r.minutes_before);
+      await query(
+        `UPDATE event_reminders
+         SET sent_ts = $1
+         WHERE event_id = $2 AND minutes_before = $3;`,
+        [String(Date.now()), String(r.event_id), r.minutes_before]
+      );
     }
   }
 }
@@ -287,14 +314,16 @@ client.on("interactionCreate", async (interaction) => {
 
         const channelId = EVENTS_CHANNEL_ID || interaction.channelId;
 
-        const eventRow = createEvent({
-          guildId: guild.id,
-          channelId,
-          name,
-          startTs,
-          notes,
-          createdBy: interaction.user.id
-        });
+        const eventRow = await createEvent({
+  guildId: guild.id,
+  channelId,
+  name,
+  startTs,
+  notes,
+  createdBy: interaction.user.id,
+  reminders: REMINDERS
+});
+
 
         await interaction.reply({
           content: `Created **Event #${eventRow.id}**: **${eventRow.name}** in <#${channelId}>.\nStart (UTC): **${fmtUtcDateTime(eventRow.start_ts)}**`,
@@ -452,9 +481,11 @@ function setupCrons() {
   }, { timezone: TZ });
 }
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  await initDb();
   setupCrons();
 });
+
 
 client.login(TOKEN);
