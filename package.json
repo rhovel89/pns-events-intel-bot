@@ -1,7 +1,7 @@
 {
   "name": "pns-events-intel-bot",
-  "version": "1.2.0",
-  "description": "Events + Intel bot for Puzzle & Survival alliances (multi-event + UTC reset + dual timezone display)",
+  "version": "2.0.0",
+  "description": "Events + Intel bot for Puzzle & Survival alliances (Postgres)",
   "main": "src/index.js",
   "type": "commonjs",
   "engines": {
@@ -12,9 +12,9 @@
     "register": "node src/register-commands.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.5",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "pg": "^8.12.0"
   }
 }
