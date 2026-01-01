@@ -1,7 +1,7 @@
 {
   "name": "pns-events-intel-bot",
-  "version": "2.0.0",
-  "description": "Events + Intel bot for Puzzle & Survival alliances (Postgres)",
+  "version": "2.1.0",
+  "description": "SDS Event Intel Bot (Postgres + recurring events)",
   "main": "src/index.js",
   "type": "commonjs",
   "engines": {
