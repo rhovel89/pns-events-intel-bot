@@ -32,9 +32,10 @@ const INTEL_CHANNEL_ID = process.env.INTEL_CHANNEL_ID || "";
 const REMINDERS = parseReminders();
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [GatewayIntentBits.Guilds],
   partials: [Partials.Channel]
 });
+
 
 // ---------------- DB Helpers (Postgres) ----------------
 
