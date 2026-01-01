@@ -1,70 +1,66 @@
 require("dotenv").config();
+
+const cron = require("node-cron");
 const {
   Client,
   GatewayIntentBits,
   Partials,
-  EmbedBuilder,
-  PermissionsBitField
+  EmbedBuilder
 } = require("discord.js");
-const cron = require("node-cron");
+
 const { query, initDb } = require("./db");
 const {
   parseReminders,
   safeTruncate,
-  parseDateTimeLocalMs,
-  parseDateTimeUtcMs,
-  nextResetUtcMs,
-  fmtUtcDateTime,
-  fmtStartBoth
+  fmtStartBoth,
+  parseStartToUtcMillis,
+  normalizeRepeatDays,
+  generateOccurrences
 } = require("./utils");
 
+// Required env
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
-  console.error("Missing DISCORD_TOKEN in environment.");
+  console.error("Missing DISCORD_TOKEN.");
   process.exit(1);
 }
 
-const TZ = process.env.TZ || "America/Chicago";
-const EVENTS_CHANNEL_ID = process.env.EVENTS_CHANNEL_ID || null;
-const INTEL_CHANNEL_ID = process.env.INTEL_CHANNEL_ID || null;
+// Optional env
+const EVENTS_CHANNEL_ID = process.env.EVENTS_CHANNEL_ID || "";
+const INTEL_CHANNEL_ID = process.env.INTEL_CHANNEL_ID || "";
 
-const RESET_UTC_HOUR = Number(process.env.RESET_UTC_HOUR ?? 0);
-const RESET_UTC_MINUTE = Number(process.env.RESET_UTC_MINUTE ?? 0);
-
-const REMINDERS = parseReminders(process.env.EVENT_REMINDERS);
+const REMINDERS = parseReminders();
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
   partials: [Partials.Channel]
 });
 
-// ---------- DB helpers (Postgres) ----------
-async function createEvent({ guildId, channelId, name, startTs, notes, createdBy, reminders }) {
+// ---------------- DB Helpers (Postgres) ----------------
+
+async function createEventRow({ guildId, channelId, templateId, occurrenceDate, name, startTs, notes, createdBy }) {
   const createdTs = Date.now();
-
   const ins = await query(
-    `INSERT INTO events (guild_id, channel_id, name, start_ts, notes, created_by, status, created_ts)
-     VALUES ($1,$2,$3,$4,$5,$6,'ACTIVE',$7)
+    `INSERT INTO events (guild_id, channel_id, template_id, occurrence_date, name, start_ts, notes, created_by, status, created_ts)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',$9)
      RETURNING *;`,
-    [guildId, channelId, name, String(startTs), notes || null, createdBy, String(createdTs)]
+    [
+      guildId,
+      channelId,
+      templateId ? String(templateId) : null,
+      occurrenceDate || null,
+      name,
+      String(startTs),
+      notes || null,
+      createdBy,
+      String(createdTs)
+    ]
   );
+  return ins.rows[0];
+}
 
-  const eventRow = ins.rows[0];
-
-  // Insert reminders
-  for (const m of reminders) {
-    const remindTs = startTs - m * 60 * 1000;
-    if (remindTs > Date.now() - 60 * 1000) {
-      await query(
-        `INSERT INTO event_reminders (event_id, minutes_before, remind_ts, sent_ts)
-         VALUES ($1,$2,$3,NULL)
-         ON CONFLICT (event_id, minutes_before) DO NOTHING;`,
-        [eventRow.id, m, String(remindTs)]
-      );
-    }
-  }
-
-  return eventRow;
+async function setEventMessageId(eventId, messageId) {
+  await query(`UPDATE events SET message_id = $1 WHERE id = $2;`, [messageId, String(eventId)]);
 }
 
 async function getEventById(eventId) {
@@ -83,16 +79,26 @@ async function listActiveEvents(guildId, limit = 15) {
   return res.rows;
 }
 
-async function endEvent(guildId, eventId) {
-  const rowRes = await query(
-    `SELECT * FROM events WHERE id = $1 AND guild_id = $2;`,
-    [String(eventId), guildId]
-  );
-  const row = rowRes.rows[0];
-  if (!row) return { ok: false };
+async function updateEventFields(eventId, patch) {
+  const fields = [];
+  const values = [];
+  let i = 1;
 
+  for (const [k, v] of Object.entries(patch)) {
+    fields.push(`${k} = $${i++}`);
+    values.push(v);
+  }
+  if (!fields.length) return;
+
+  values.push(String(eventId));
+  await query(`UPDATE events SET ${fields.join(", ")} WHERE id = $${i};`, values);
+}
+
+async function endEvent(guildId, eventId) {
+  const res = await query(`SELECT * FROM events WHERE id = $1 AND guild_id = $2;`, [String(eventId), guildId]);
+  if (!res.rows[0]) return { ok: false };
   await query(`UPDATE events SET status = 'ENDED' WHERE id = $1;`, [String(eventId)]);
-  return { ok: true, row };
+  return { ok: true, row: res.rows[0] };
 }
 
 async function upsertRsvp(eventId, userId, choice) {
@@ -114,7 +120,6 @@ async function getRsvpCounts(eventId) {
      GROUP BY choice;`,
     [String(eventId)]
   );
-
   const counts = { YES: 0, NO: 0, MAYBE: 0 };
   for (const r of res.rows) counts[r.choice] = r.count;
   return counts;
@@ -127,97 +132,248 @@ async function getRsvpLists(eventId) {
      WHERE event_id = $1;`,
     [String(eventId)]
   );
-
   const lists = { YES: [], NO: [], MAYBE: [] };
   for (const r of res.rows) lists[r.choice]?.push(r.user_id);
   return lists;
 }
 
-// Intel
-async function addCheckin(guildId, userId) {
-  await query(
-    `INSERT INTO checkins (guild_id, user_id, ts) VALUES ($1,$2,$3);`,
-    [guildId, userId, String(Date.now())]
-  );
+async function insertRemindersForEvent(eventId, startTs) {
+  for (const m of REMINDERS) {
+    const remindTs = startTs - m * 60 * 1000;
+    // skip reminders already in past
+    if (remindTs <= Date.now() - 60 * 1000) continue;
+
+    await query(
+      `INSERT INTO event_reminders (event_id, minutes_before, remind_ts, sent_ts)
+       VALUES ($1,$2,$3,NULL)
+       ON CONFLICT (event_id, minutes_before) DO NOTHING;`,
+      [String(eventId), m, String(remindTs)]
+    );
+  }
 }
 
-async function leaderboard7d(guildId) {
-  const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const res = await query(
-    `SELECT user_id, COUNT(*)::int AS cnt
-     FROM checkins
-     WHERE guild_id = $1 AND ts::bigint >= $2
-     GROUP BY user_id
-     ORDER BY cnt DESC
-     LIMIT 20;`,
-    [guildId, String(since)]
-  );
-  return res.rows;
-}
-
-async function lastCheckinByUser(guildId) {
-  const res = await query(
-    `SELECT user_id, MAX(ts)::bigint AS last_ts
-     FROM checkins
-     WHERE guild_id = $1
-     GROUP BY user_id;`,
-    [guildId]
-  );
-  return res.rows.map(r => ({ user_id: r.user_id, last_ts: Number(r.last_ts) }));
-}
-
-// ---------- Rendering ----------
-function eventEmbed(eventRow) {
 async function eventEmbed(eventRow) {
+  const startMs = Number(eventRow.start_ts);
   const counts = await getRsvpCounts(eventRow.id);
   const lists = await getRsvpLists(eventRow.id);
 
+  const lines = [];
+  lines.push(`**Start**\n${fmtStartBoth(startMs)}`);
+
+  if (eventRow.notes) lines.push(`**Notes:** ${safeTruncate(eventRow.notes, 900)}`);
+
+  lines.push("");
+  lines.push(`**RSVPs:** ✅ Yes ${counts.YES} | ❔ Maybe ${counts.MAYBE} | ❌ No ${counts.NO}`);
+  lines.push("");
+  lines.push(`**Yes:** ${lists.YES.length ? lists.YES.map(id => `<@${id}>`).join(", ") : "—"}`);
+  lines.push(`**Maybe:** ${lists.MAYBE.length ? lists.MAYBE.map(id => `<@${id}>`).join(", ") : "—"}`);
+  lines.push(`**No:** ${lists.NO.length ? lists.NO.map(id => `<@${id}>`).join(", ") : "—"}`);
+
+  if (eventRow.template_id) {
+    lines.push("");
+    lines.push(`**Series:** Template #${eventRow.template_id}`);
+  }
+
   const embed = new EmbedBuilder()
     .setTitle(`Event #${eventRow.id}: ${eventRow.name}`)
-    .setDescription(
-      [
-        `**Start**\n${fmtStartBoth(Number(eventRow.start_ts))}`,
-        eventRow.notes ? `**Notes:** ${safeTruncate(eventRow.notes, 800)}` : null,
-        "",
-        `**RSVPs:** ✅ Yes ${counts.YES} | ❔ Maybe ${counts.MAYBE} | ❌ No ${counts.NO}`,
-        "",
-        `**Yes:** ${lists.YES.length ? lists.YES.map(id => `<@${id}>`).join(", ") : "—"}`,
-        `**Maybe:** ${lists.MAYBE.length ? lists.MAYBE.map(id => `<@${id}>`).join(", ") : "—"}`,
-        `**No:** ${lists.NO.length ? lists.NO.map(id => `<@${id}>`).join(", ") : "—"}`
-      ].filter(Boolean).join("\n")
-    )
+    .setDescription(lines.join("\n"))
     .setFooter({ text: `Status: ${eventRow.status}` })
     .setTimestamp(new Date(Number(eventRow.created_ts)));
 
   return embed;
 }
 
+async function resolvePostingChannel(interaction, guildId) {
+  // If EVENTS_CHANNEL_ID is set, force posts there.
+  if (EVENTS_CHANNEL_ID) {
+    const ch = await client.channels.fetch(EVENTS_CHANNEL_ID).catch(() => null);
+    if (ch && ch.isTextBased()) return ch;
+  }
+  // fallback to channel command invoked in
+  return interaction.channel;
+}
 
-async function postEventMessage(eventRow) {
+async function postOrUpdateEventMessage(eventRow, channel) {
+  if (!channel || !channel.isTextBased()) return;
+
+  // If we have a message id, try to edit
+  if (eventRow.message_id) {
+    const msg = await channel.messages.fetch(eventRow.message_id).catch(() => null);
+    if (msg) {
+      await msg.edit({ embeds: [await eventEmbed(eventRow)] }).catch(() => null);
+      return;
+    }
+  }
+
+  // else create
   const msg = await channel.send({ embeds: [await eventEmbed(eventRow)] }).catch(() => null);
-  if (!channel || !channel.isTextBased()) return null;
-
-  const msg = await channel.send({ embeds: [eventEmbed(eventRow)] }).catch(() => null);
-  if (!msg) return null;
-
-  db.prepare("UPDATE events SET message_id = ? WHERE id = ?").run(msg.id, eventRow.id);
-  return msg;
+  if (msg) {
+    await setEventMessageId(eventRow.id, msg.id);
+  }
 }
 
 async function updateEventMessage(eventId) {
-  await msg.edit({ embeds: [await eventEmbed(eventRow)] }).catch(() => null);
-  if (!eventRow || !eventRow.message_id) return;
+  const row = await getEventById(eventId);
+  if (!row) return;
 
-  const channel = await client.channels.fetch(eventRow.channel_id).catch(() => null);
+  const channel = await client.channels.fetch(row.channel_id).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
 
-  const msg = await channel.messages.fetch(eventRow.message_id).catch(() => null);
-  if (!msg) return;
-
-  await msg.edit({ embeds: [eventEmbed(eventRow)] }).catch(() => null);
+  await postOrUpdateEventMessage(row, channel);
 }
 
-// ---------- Reminder scanner ----------
+// ---------------- Recurring Templates ----------------
+
+async function createTemplate({ guildId, name, dateYmd, timeHhmm, timeZone, repeatDays, weeksAhead, notes, createdBy }) {
+  const createdTs = Date.now();
+
+  const ins = await query(
+    `INSERT INTO recurring_templates
+      (guild_id, name, time_hhmm, time_zone, repeat_days, weeks_ahead, notes, created_by, active, created_ts)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)
+     RETURNING *;`,
+    [
+      guildId,
+      name,
+      timeHhmm,
+      (timeZone || "UTC").trim(),
+      normalizeRepeatDays(repeatDays),
+      weeksAhead,
+      notes || null,
+      createdBy,
+      String(createdTs)
+    ]
+  );
+
+  // We keep the anchor date as the first generation anchor (not stored). We generate immediately using dateYmd.
+  const template = ins.rows[0];
+  template._anchorDateYmd = dateYmd;
+
+  return template;
+}
+
+async function getTemplate(guildId, templateId) {
+  const res = await query(
+    `SELECT * FROM recurring_templates WHERE id = $1 AND guild_id = $2;`,
+    [String(templateId), guildId]
+  );
+  return res.rows[0] || null;
+}
+
+async function listTemplates(guildId) {
+  const res = await query(
+    `SELECT * FROM recurring_templates
+     WHERE guild_id = $1
+     ORDER BY id DESC
+     LIMIT 25;`,
+    [guildId]
+  );
+  return res.rows;
+}
+
+async function disableTemplate(guildId, templateId) {
+  await query(
+    `UPDATE recurring_templates SET active = FALSE WHERE id = $1 AND guild_id = $2;`,
+    [String(templateId), guildId]
+  );
+}
+
+async function editTemplate(guildId, templateId, patch) {
+  const fields = [];
+  const vals = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(patch)) {
+    fields.push(`${k} = $${i++}`);
+    vals.push(v);
+  }
+  if (!fields.length) return;
+
+  vals.push(String(templateId), guildId);
+  await query(
+    `UPDATE recurring_templates SET ${fields.join(", ")} WHERE id = $${i++} AND guild_id = $${i};`,
+    vals
+  );
+}
+
+async function generateFromTemplate({ guildId, template, anchorDateYmd, channelId, createdBy }) {
+  const weeksAhead = Number(template.weeks_ahead);
+  const occs = generateOccurrences({
+    anchorDateYmd,
+    timeHhmm: template.time_hhmm,
+    timeZone: template.time_zone,
+    repeatDaysCsv: template.repeat_days,
+    weeksAhead
+  });
+
+  let created = 0;
+  for (const occ of occs) {
+    // Insert occurrence; unique index prevents duplicates
+    try {
+      const row = await createEventRow({
+        guildId,
+        channelId,
+        templateId: template.id,
+        occurrenceDate: occ.occurrenceDate,
+        name: template.name,
+        startTs: occ.startUtcMs,
+        notes: template.notes,
+        createdBy
+      });
+      await insertRemindersForEvent(row.id, Number(row.start_ts));
+      created++;
+    } catch (e) {
+      // Duplicate insert due to unique constraint -> ignore
+    }
+  }
+
+  return { created, total: occs.length };
+}
+
+async function applyTemplateToExistingFutureOccurrences(guildId, template, nowMs = Date.now()) {
+  // Update future ACTIVE occurrences for this template: name/notes and recompute start_ts using occurrence_date + template time/tz
+  const res = await query(
+    `SELECT id, occurrence_date
+     FROM events
+     WHERE guild_id = $1
+       AND template_id = $2
+       AND status = 'ACTIVE'
+       AND start_ts::bigint > $3
+       AND occurrence_date IS NOT NULL;`,
+    [guildId, String(template.id), String(nowMs)]
+  );
+
+  // Regenerate each event start_ts using its stored occurrence_date (date in template tz)
+  // Use a one-week generation window trick: build from that date only.
+  for (const r of res.rows) {
+    const ymd = r.occurrence_date.toISOString().slice(0, 10); // YYYY-MM-DD
+    const occs = generateOccurrences({
+      anchorDateYmd: ymd,
+      timeHhmm: template.time_hhmm,
+      timeZone: template.time_zone,
+      repeatDaysCsv: normalizeRepeatDays(template.repeat_days),
+      weeksAhead: 1
+    });
+
+    // Find exact occurrence matching that date
+    const occ = occs.find(x => x.occurrenceDate === ymd);
+    if (!occ) continue;
+
+    await updateEventFields(r.id, {
+      name: template.name,
+      notes: template.notes || null,
+      start_ts: String(occ.startUtcMs)
+    });
+
+    // Rebuild reminders for that event (simple approach: delete + reinsert)
+    await query(`DELETE FROM event_reminders WHERE event_id = $1;`, [String(r.id)]);
+    await insertRemindersForEvent(r.id, occ.startUtcMs);
+
+    await updateEventMessage(r.id);
+  }
+}
+
+// ---------------- Reminders ----------------
+
 async function scanAndSendReminders() {
   const now = Date.now();
   const windowStart = now - 30 * 1000;
@@ -261,231 +417,418 @@ async function scanAndSendReminders() {
   }
 }
 
-// ---------- Start parsing ----------
-function resolveStartTs(startInput) {
-  const raw = startInput.trim();
-  const s = raw.toLowerCase();
+// Daily recurring “top-up” (keeps series healthy on Railway)
+async function topUpRecurringTemplates() {
+  // Simple policy: re-generate from "today" for weeks_ahead in template tz.
+  // Since unique constraint prevents duplicates, this is safe.
+  const guilds = client.guilds.cache.map(g => g.id);
+  for (const guildId of guilds) {
+    const tRes = await query(
+      `SELECT * FROM recurring_templates WHERE guild_id = $1 AND active = TRUE;`,
+      [guildId]
+    );
+    if (!tRes.rows.length) continue;
 
-  // UTC reset keywords (game time)
-  if (s === "utcreset" || s === "nextutcreset" || s === "utc reset") {
-    return nextResetUtcMs({ resetUtcHour: RESET_UTC_HOUR, resetUtcMinute: RESET_UTC_MINUTE });
+    // Use today (UTC date string) as anchor for top-up
+    const todayUtc = new Date().toISOString().slice(0, 10);
+
+    for (const t of tRes.rows) {
+      const channelId = EVENTS_CHANNEL_ID || null;
+      const channel = channelId
+        ? await client.channels.fetch(channelId).catch(() => null)
+        : null;
+
+      // If no forced channel, we cannot safely post series to unknown channel; skip.
+      // (You can remove this skip if you want it to default to command channel only.)
+      if (!EVENTS_CHANNEL_ID || !channel || !channel.isTextBased()) continue;
+
+      await generateFromTemplate({
+        guildId,
+        template: t,
+        anchorDateYmd: todayUtc,
+        channelId: channel.id,
+        createdBy: t.created_by
+      });
+    }
   }
-
-  // Explicit UTC datetime: "utc:YYYY-MM-DD HH:mm"
-  if (s.startsWith("utc:")) {
-    const dt = raw.slice(4).trim();
-    return parseDateTimeUtcMs(dt);
-  }
-
-  // Default: treat input as local server time
-  return parseDateTimeLocalMs(raw);
 }
 
-// ---------- Interactions ----------
-client.on("interactionCreate", async (interaction) => {
+// ---------------- Command handlers ----------------
+
+client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
-  const guild = interaction.guild;
-  if (!guild) return;
 
   try {
     if (interaction.commandName === "event") {
-      const sub = interaction.options.getSubcommand();
+      const guildId = interaction.guildId;
+      if (!guildId) return;
 
-      if (sub === "create") {
-        const member = interaction.member;
-        const hasPerm = member.permissions?.has(PermissionsBitField.Flags.ManageGuild);
-        if (!hasPerm) {
-          await interaction.reply({ content: "You need **Manage Server** permission to create events.", ephemeral: true });
-          return;
+      // Recurring group?
+      const group = interaction.options.getSubcommandGroup(false);
+      const sub = interaction.options.getSubcommand(true);
+
+      // ---------- Recurring ----------
+      if (group === "recurring") {
+        if (sub === "create") {
+          await interaction.deferReply({ ephemeral: true });
+
+          const name = interaction.options.getString("name", true);
+          const date = interaction.options.getString("date", true);
+          const time = interaction.options.getString("time", true);
+          const timeZone = interaction.options.getString("time_zone") || "UTC";
+          const repeatDays = interaction.options.getString("repeat_days", true);
+          const weeksAhead = interaction.options.getInteger("weeks_ahead", true);
+          const notes = interaction.options.getString("notes") || null;
+
+          const postChannel = await resolvePostingChannel(interaction, guildId);
+          if (!postChannel || !postChannel.isTextBased()) {
+            return interaction.editReply("I cannot post to the configured events channel. Check channel ID and permissions.");
+          }
+
+          const template = await createTemplate({
+            guildId,
+            name,
+            dateYmd: date,
+            timeHhmm: time,
+            timeZone,
+            repeatDays,
+            weeksAhead,
+            notes,
+            createdBy: interaction.user.id
+          });
+
+          // Generate initial occurrences using the provided anchor date
+          const { created, total } = await generateFromTemplate({
+            guildId,
+            template,
+            anchorDateYmd: date,
+            channelId: postChannel.id,
+            createdBy: interaction.user.id
+          });
+
+          return interaction.editReply(
+            `Recurring template **#${template.id}** created.\nGenerated **${created}** events (out of ${total} candidates) into ${postChannel}.`
+          );
         }
+
+        if (sub === "list") {
+          await interaction.deferReply({ ephemeral: true });
+
+          const rows = await listTemplates(guildId);
+          if (!rows.length) return interaction.editReply("No recurring templates found.");
+
+          const lines = rows.map(t => {
+            const active = t.active ? "ACTIVE" : "DISABLED";
+            return `**#${t.id}** • ${t.name} • ${t.repeat_days.toUpperCase()} @ ${t.time_hhmm} (${t.time_zone}) • weeks_ahead=${t.weeks_ahead} • ${active}`;
+          });
+
+          return interaction.editReply(lines.join("\n"));
+        }
+
+        if (sub === "disable") {
+          await interaction.deferReply({ ephemeral: true });
+
+          const templateId = interaction.options.getInteger("template_id", true);
+          const t = await getTemplate(guildId, templateId);
+          if (!t) return interaction.editReply("Template not found.");
+
+          await disableTemplate(guildId, templateId);
+          return interaction.editReply(`Template #${templateId} disabled.`);
+        }
+
+        if (sub === "extend") {
+          await interaction.deferReply({ ephemeral: true });
+
+          const templateId = interaction.options.getInteger("template_id", true);
+          const weeksAhead = interaction.options.getInteger("weeks_ahead", true);
+
+          const t = await getTemplate(guildId, templateId);
+          if (!t) return interaction.editReply("Template not found.");
+
+          await editTemplate(guildId, templateId, { weeks_ahead: weeksAhead });
+
+          const postChannel = await resolvePostingChannel(interaction, guildId);
+          if (!postChannel || !postChannel.isTextBased()) {
+            return interaction.editReply("I cannot post to the configured events channel. Check channel ID and permissions.");
+          }
+
+          // Use today as anchor for extension generation
+          const todayUtc = new Date().toISOString().slice(0, 10);
+
+          const updated = await getTemplate(guildId, templateId);
+          const { created } = await generateFromTemplate({
+            guildId,
+            template: updated,
+            anchorDateYmd: todayUtc,
+            channelId: postChannel.id,
+            createdBy: interaction.user.id
+          });
+
+          return interaction.editReply(`Template #${templateId} updated to weeks_ahead=${weeksAhead}. Generated ${created} additional events.`);
+        }
+
+        if (sub === "edit") {
+          await interaction.deferReply({ ephemeral: true });
+
+          const templateId = interaction.options.getInteger("template_id", true);
+          const t = await getTemplate(guildId, templateId);
+          if (!t) return interaction.editReply("Template not found.");
+
+          const patch = {};
+          const name = interaction.options.getString("name");
+          const time = interaction.options.getString("time");
+          const timeZone = interaction.options.getString("time_zone");
+          const repeatDays = interaction.options.getString("repeat_days");
+          const weeksAhead = interaction.options.getInteger("weeks_ahead");
+          const notes = interaction.options.getString("notes");
+          const applyToExisting = interaction.options.getBoolean("apply_to_existing") || false;
+
+          if (name) patch.name = name;
+          if (time) patch.time_hhmm = time;
+          if (timeZone) patch.time_zone = timeZone.trim();
+          if (repeatDays) patch.repeat_days = normalizeRepeatDays(repeatDays);
+          if (Number.isFinite(weeksAhead)) patch.weeks_ahead = weeksAhead;
+          if (notes !== null) patch.notes = notes; // can set empty string if desired
+
+          await editTemplate(guildId, templateId, patch);
+
+          const updated = await getTemplate(guildId, templateId);
+
+          // Optionally apply to already-created future occurrences
+          if (applyToExisting) {
+            await applyTemplateToExistingFutureOccurrences(guildId, updated);
+          }
+
+          return interaction.editReply(`Template #${templateId} updated.${applyToExisting ? " Applied to existing future occurrences." : ""}`);
+        }
+
+        return;
+      }
+
+      // ---------- Non-recurring ----------
+      if (sub === "create") {
+        await interaction.deferReply({ ephemeral: true });
 
         const name = interaction.options.getString("name", true);
-        const start = interaction.options.getString("start", true);
+        const startRaw = interaction.options.getString("start", true);
+        const timeZone = interaction.options.getString("time_zone") || "UTC";
         const notes = interaction.options.getString("notes") || null;
 
-        const startTs = resolveStartTs(start);
-        if (!startTs) {
-          await interaction.reply({
-            content: "Invalid start. Use `utcreset` or `utc:YYYY-MM-DD HH:mm` or local `YYYY-MM-DD HH:mm`.",
-            ephemeral: true
-          });
-          return;
+        const startTs = parseStartToUtcMillis({ startRaw, timeZone });
+
+        const postChannel = await resolvePostingChannel(interaction, guildId);
+        if (!postChannel || !postChannel.isTextBased()) {
+          return interaction.editReply("I cannot post to the configured events channel. Check channel ID and permissions.");
         }
 
-        const channelId = EVENTS_CHANNEL_ID || interaction.channelId;
-
-        const eventRow = await createEvent({
-  guildId: guild.id,
-  channelId,
-  name,
-  startTs,
-  notes,
-  createdBy: interaction.user.id,
-  reminders: REMINDERS
-});
-
-
-        await interaction.reply({
-          content: `Created **Event #${eventRow.id}**: **${eventRow.name}** in <#${channelId}>.\nStart (UTC): **${fmtUtcDateTime(eventRow.start_ts)}**`,
-          ephemeral: true
+        const row = await createEventRow({
+          guildId,
+          channelId: postChannel.id,
+          templateId: null,
+          occurrenceDate: null,
+          name,
+          startTs,
+          notes,
+          createdBy: interaction.user.id
         });
 
-        await postEventMessage(eventRow);
-        return;
+        await insertRemindersForEvent(row.id, startTs);
+        await postOrUpdateEventMessage(row, postChannel);
+
+        return interaction.editReply(`Created **Event #${row.id}** in ${postChannel}.`);
       }
 
       if (sub === "list") {
-        const rows = listActiveEvents(guild.id, 15);
-        if (!rows.length) {
-          await interaction.reply({ content: "No active events.", ephemeral: true });
-          return;
-        }
+        await interaction.deferReply({ ephemeral: true });
 
-        const desc = rows.map(e =>
-          `**#${e.id}** — **${e.name}**\n• Local: ${require("./utils").fmtDiscordTs(e.start_ts)}\n• UTC: ${fmtUtcDateTime(e.start_ts)}`
-        ).join("\n\n");
+        const rows = await listActiveEvents(guildId, 20);
+        if (!rows.length) return interaction.editReply("No active events.");
 
-        const embed = new EmbedBuilder()
-          .setTitle("Active Events")
-          .setDescription(desc)
-          .setTimestamp(new Date());
-
-        await interaction.reply({ embeds: [embed] });
-        return;
+        const lines = rows.map(r => `**#${r.id}** • ${r.name} • ${fmtStartBoth(Number(r.start_ts))}`);
+        return interaction.editReply(lines.join("\n"));
       }
 
       if (sub === "status") {
+        await interaction.deferReply({ ephemeral: true });
+
         const eventId = interaction.options.getInteger("event_id", true);
-        const row = getEventById(eventId);
-        if (!row || row.guild_id !== guild.id) {
-          await interaction.reply({ content: "Event not found for this server.", ephemeral: true });
-          return;
-        }
-        await interaction.reply({ embeds: [eventEmbed(row)] });
-        return;
+        const row = await getEventById(eventId);
+        if (!row) return interaction.editReply("Event not found.");
+
+        const embed = await eventEmbed(row);
+        return interaction.editReply({ embeds: [embed] });
       }
 
       if (sub === "rsvp") {
+        await interaction.deferReply({ ephemeral: true });
+
         const eventId = interaction.options.getInteger("event_id", true);
         const choice = interaction.options.getString("choice", true);
 
-        const row = getEventById(eventId);
-        if (!row || row.guild_id !== guild.id || row.status !== "ACTIVE") {
-          await interaction.reply({ content: "That event is not active (or not found).", ephemeral: true });
-          return;
-        }
+        const row = await getEventById(eventId);
+        if (!row || row.status !== "ACTIVE") return interaction.editReply("Event not found or not active.");
 
-        upsertRsvp(eventId, interaction.user.id, choice);
-        await interaction.reply({ content: `RSVP saved: **${choice}** for **Event #${row.id} — ${row.name}**.`, ephemeral: true });
+        await upsertRsvp(eventId, interaction.user.id, choice);
         await updateEventMessage(eventId);
-        return;
+
+        return interaction.editReply(`RSVP saved for Event #${eventId}: **${choice}**`);
       }
 
       if (sub === "end") {
-        const member = interaction.member;
-        const hasPerm = member.permissions?.has(PermissionsBitField.Flags.ManageGuild);
-        if (!hasPerm) {
-          await interaction.reply({ content: "You need **Manage Server** permission to end events.", ephemeral: true });
-          return;
-        }
+        await interaction.deferReply({ ephemeral: true });
 
         const eventId = interaction.options.getInteger("event_id", true);
-        const res = endEvent(guild.id, eventId);
-        if (!res.ok) {
-          await interaction.reply({ content: "Event not found for this server.", ephemeral: true });
-          return;
+        const res = await endEvent(guildId, eventId);
+        if (!res.ok) return interaction.editReply("Event not found.");
+
+        await updateEventMessage(eventId);
+        return interaction.editReply(`Event #${eventId} ended.`);
+      }
+
+      if (sub === "edit") {
+        await interaction.deferReply({ ephemeral: true });
+
+        const eventId = interaction.options.getInteger("event_id", true);
+        const row = await getEventById(eventId);
+        if (!row) return interaction.editReply("Event not found.");
+
+        const patch = {};
+        const name = interaction.options.getString("name");
+        const startRaw = interaction.options.getString("start");
+        const timeZone = interaction.options.getString("time_zone") || "UTC";
+        const notes = interaction.options.getString("notes");
+
+        if (name) patch.name = name;
+        if (notes !== null) patch.notes = notes;
+
+        if (startRaw) {
+          const startTs = parseStartToUtcMillis({ startRaw, timeZone });
+          patch.start_ts = String(startTs);
+
+          // rebuild reminders
+          await query(`DELETE FROM event_reminders WHERE event_id = $1;`, [String(eventId)]);
+          await insertRemindersForEvent(eventId, startTs);
         }
 
-        await interaction.reply({ content: `Event ended: **#${eventId} — ${res.row.name}**.`, ephemeral: true });
+        await updateEventFields(eventId, patch);
         await updateEventMessage(eventId);
-        return;
+
+        return interaction.editReply(`Event #${eventId} updated.`);
       }
     }
 
     if (interaction.commandName === "intel") {
-      const sub = interaction.options.getSubcommand();
+      const sub = interaction.options.getSubcommand(true);
+      const guildId = interaction.guildId;
+      if (!guildId) return;
 
       if (sub === "checkin") {
-        addCheckin(guild.id, interaction.user.id);
-        await interaction.reply({ content: "Check-in recorded. Thank you.", ephemeral: true });
-        return;
+        await interaction.deferReply({ ephemeral: true });
+
+        await query(`INSERT INTO checkins (guild_id, user_id, ts) VALUES ($1,$2,$3);`, [
+          guildId,
+          interaction.user.id,
+          String(Date.now())
+        ]);
+
+        if (INTEL_CHANNEL_ID) {
+          const ch = await client.channels.fetch(INTEL_CHANNEL_ID).catch(() => null);
+          if (ch && ch.isTextBased()) {
+            await ch.send(`✅ Check-in: <@${interaction.user.id}>`).catch(() => null);
+          }
+        }
+
+        return interaction.editReply("Check-in recorded.");
       }
 
       if (sub === "leaderboard") {
-        const rows = leaderboard7d(guild.id);
-        const desc = rows.length
-          ? rows.map((r, i) => `**${i + 1}.** <@${r.user_id}> — ${r.cnt}`).join("\n")
-          : "No check-ins yet in the last 7 days.";
+        await interaction.deferReply({ ephemeral: true });
 
-        const embed = new EmbedBuilder()
-          .setTitle("Check-in Leaderboard (Last 7 Days)")
-          .setDescription(desc)
-          .setTimestamp(new Date());
+        const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+        const res = await query(
+          `SELECT user_id, COUNT(*)::int AS cnt
+           FROM checkins
+           WHERE guild_id = $1 AND ts::bigint >= $2
+           GROUP BY user_id
+           ORDER BY cnt DESC
+           LIMIT 20;`,
+          [guildId, String(since)]
+        );
 
-        await interaction.reply({ embeds: [embed] });
-        return;
+        if (!res.rows.length) return interaction.editReply("No check-ins in the last 7 days.");
+
+        const lines = res.rows.map((r, i) => `${i + 1}. <@${r.user_id}> — **${r.cnt}**`);
+        return interaction.editReply(lines.join("\n"));
       }
     }
 
     if (interaction.commandName === "inactive") {
-      const days = interaction.options.getInteger("days") || 7;
-      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+      const sub = interaction.options.getSubcommand(true);
+      const guildId = interaction.guildId;
+      if (!guildId) return;
 
-      const lastRows = lastCheckinByUser(guild.id).filter(r => r.last_ts < cutoff);
+      if (sub === "check") {
+        await interaction.deferReply({ ephemeral: true });
 
-      const desc = lastRows.length
-        ? lastRows
-            .sort((a, b) => a.last_ts - b.last_ts)
-            .slice(0, 40)
-            .map(r => `<@${r.user_id}> — last check-in ${require("./utils").fmtDiscordTs(r.last_ts)}`)
-            .join("\n")
-        : `No users found with check-ins older than ${days} days.`;
+        const days = interaction.options.getInteger("days") || 7;
+        const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
 
-      const embed = new EmbedBuilder()
-        .setTitle(`Inactive Check (>${days} days since check-in)`)
-        .setDescription(desc)
-        .setTimestamp(new Date());
+        // Last check-in per user
+        const res = await query(
+          `SELECT user_id, MAX(ts)::bigint AS last_ts
+           FROM checkins
+           WHERE guild_id = $1
+           GROUP BY user_id;`,
+          [guildId]
+        );
 
-      await interaction.reply({ embeds: [embed] });
-      return;
+        const lastMap = new Map(res.rows.map(r => [r.user_id, Number(r.last_ts)]));
+
+        // Compare against guild members
+        const guild = interaction.guild;
+        await guild.members.fetch().catch(() => null);
+
+        const inactive = [];
+        for (const [, m] of guild.members.cache) {
+          if (m.user.bot) continue;
+          const last = lastMap.get(m.id);
+          if (!last || last < cutoff) inactive.push(m.id);
+        }
+
+        if (!inactive.length) return interaction.editReply(`No members are inactive by check-ins (>${days} days).`);
+
+        const list = inactive.slice(0, 40).map(id => `<@${id}>`).join(", ");
+        const more = inactive.length > 40 ? `\n…and ${inactive.length - 40} more.` : "";
+        return interaction.editReply(`Inactive (no check-in within **${days}** days):\n${list}${more}`);
+      }
     }
   } catch (err) {
     console.error(err);
     if (interaction.deferred || interaction.replied) {
-      await interaction.followUp({ content: "An error occurred while processing that command.", ephemeral: true }).catch(() => {});
+      await interaction.editReply("An error occurred while processing that command. Check logs.").catch(() => null);
     } else {
-      await interaction.reply({ content: "An error occurred while processing that command.", ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: "An error occurred while processing that command. Check logs.", ephemeral: true }).catch(() => null);
     }
   }
 });
 
-// ---------- Cron jobs ----------
-function setupCrons() {
-  // Scan reminders every minute
-  cron.schedule("* * * * *", async () => {
-    await scanAndSendReminders();
-  }, { timezone: TZ });
-
-  // Daily check-in prompt at 10:00 AM Central (admin convenience)
-  cron.schedule("0 10 * * *", async () => {
-    if (!INTEL_CHANNEL_ID) return;
-    const channel = await client.channels.fetch(INTEL_CHANNEL_ID).catch(() => null);
-    if (!channel || !channel.isTextBased()) return;
-
-    const embed = new EmbedBuilder()
-      .setTitle("Daily Check-In")
-      .setDescription("Use `/intel checkin` to mark yourself active today.")
-      .setTimestamp(new Date());
-
-    await channel.send({ embeds: [embed] }).catch(() => null);
-  }, { timezone: TZ });
-}
+// ---------------- Startup / Cron ----------------
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   await initDb();
-  setupCrons();
-});
 
+  // Scan reminders every minute
+  cron.schedule("*/1 * * * *", async () => {
+    await scanAndSendReminders().catch(() => null);
+  });
+
+  // Top-up recurring templates daily at 00:05 UTC (requires EVENTS_CHANNEL_ID to be set)
+  cron.schedule("5 0 * * *", async () => {
+    await topUpRecurringTemplates().catch(() => null);
+  }, { timezone: "UTC" });
+
+  console.log("Schedulers started.");
+});
 
 client.login(TOKEN);
