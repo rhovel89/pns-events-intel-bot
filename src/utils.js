@@ -4,17 +4,21 @@ function safeTruncate(s, max = 1000) {
   return str.length > max ? str.slice(0, max - 3) + "..." : str;
 }
 
-function parseReminders(remStr, fallbackArr) {
-  if (!remStr) return [...fallbackArr];
-  const parts = String(remStr)
-    .split(",")
-    .map(x => x.trim())
-    .filter(Boolean)
-    .map(x => Number(x))
-    .filter(n => Number.isFinite(n) && n > 0);
+function parseReminders() {
+  const raw = process.env.EVENT_REMINDERS;
 
-  return parts.length ? parts : [...fallbackArr];
+  // Default reminders if env is missing/blank
+  if (!raw || !raw.trim()) return [60, 15, 5];
+
+  const arr = raw
+    .split(",")
+    .map(x => parseInt(x.trim(), 10))
+    .filter(n => Number.isFinite(n) && n > 0)
+    .sort((a, b) => b - a);
+
+  return arr.length ? arr : [60, 15, 5];
 }
+
 
 // Discord timestamps auto-convert to viewer's local timezone.
 // We show both the auto-local Discord timestamp and explicit UTC.
