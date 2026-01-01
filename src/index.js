@@ -230,7 +230,7 @@ async function createTemplate({ guildId, name, dateYmd, timeHhmm, timeZone, repe
 
   const ins = await query(
     `INSERT INTO recurring_templates
-      (guild_id, name, time_hhmm, time_zone, repeat_days, weeks_ahead, notes, created_by, active, created_ts)
+      (guild_id, name, time_hhmm, tz, repeat_days, weeks_ahead, notes, created_by, active, created_ts)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)
      RETURNING *;`,
     [
@@ -301,7 +301,7 @@ async function generateFromTemplate({ guildId, template, anchorDateYmd, channelI
   const occs = generateOccurrences({
     anchorDateYmd,
     timeHhmm: template.time_hhmm,
-    timeZone: template.time_zone,
+    timeZone: template.tz,
     repeatDaysCsv: template.repeat_days,
     weeksAhead
   });
@@ -350,7 +350,7 @@ async function applyTemplateToExistingFutureOccurrences(guildId, template, nowMs
     const occs = generateOccurrences({
       anchorDateYmd: ymd,
       timeHhmm: template.time_hhmm,
-      timeZone: template.time_zone,
+      timeZone: template.tz,
       repeatDaysCsv: normalizeRepeatDays(template.repeat_days),
       weeksAhead: 1
     });
@@ -476,7 +476,7 @@ client.on("interactionCreate", async interaction => {
           const name = interaction.options.getString("name", true);
           const date = interaction.options.getString("date", true);
           const time = interaction.options.getString("time", true);
-          const timeZone = interaction.options.getString("time_zone") || "UTC";
+          const timeZone = interaction.options.getString("tz") || "UTC";
           const repeatDays = interaction.options.getString("repeat_days", true);
           const weeksAhead = interaction.options.getInteger("weeks_ahead", true);
           const notes = interaction.options.getString("notes") || null;
@@ -520,7 +520,7 @@ client.on("interactionCreate", async interaction => {
 
           const lines = rows.map(t => {
             const active = t.active ? "ACTIVE" : "DISABLED";
-            return `**#${t.id}** • ${t.name} • ${t.repeat_days.toUpperCase()} @ ${t.time_hhmm} (${t.time_zone}) • weeks_ahead=${t.weeks_ahead} • ${active}`;
+            return `**#${t.id}** • ${t.name} • ${t.repeat_days.toUpperCase()} @ ${t.time_hhmm} (${t.tz}) • weeks_ahead=${t.weeks_ahead} • ${active}`;
           });
 
           return interaction.editReply(lines.join("\n"));
@@ -578,7 +578,7 @@ client.on("interactionCreate", async interaction => {
           const patch = {};
           const name = interaction.options.getString("name");
           const time = interaction.options.getString("time");
-          const timeZone = interaction.options.getString("time_zone");
+          const timeZone = interaction.options.getString("tz");
           const repeatDays = interaction.options.getString("repeat_days");
           const weeksAhead = interaction.options.getInteger("weeks_ahead");
           const notes = interaction.options.getString("notes");
@@ -586,7 +586,7 @@ client.on("interactionCreate", async interaction => {
 
           if (name) patch.name = name;
           if (time) patch.time_hhmm = time;
-          if (timeZone) patch.time_zone = timeZone.trim();
+          if (timeZone) patch.tz = timeZone.trim();
           if (repeatDays) patch.repeat_days = normalizeRepeatDays(repeatDays);
           if (Number.isFinite(weeksAhead)) patch.weeks_ahead = weeksAhead;
           if (notes !== null) patch.notes = notes; // can set empty string if desired
@@ -612,7 +612,7 @@ client.on("interactionCreate", async interaction => {
 
         const name = interaction.options.getString("name", true);
         const startRaw = interaction.options.getString("start", true);
-        const timeZone = interaction.options.getString("time_zone") || "UTC";
+        const timeZone = interaction.options.getString("tz") || "UTC";
         const notes = interaction.options.getString("notes") || null;
 
         const startTs = parseStartToUtcMillis({ startRaw, timeZone });
@@ -696,7 +696,7 @@ client.on("interactionCreate", async interaction => {
         const patch = {};
         const name = interaction.options.getString("name");
         const startRaw = interaction.options.getString("start");
-        const timeZone = interaction.options.getString("time_zone") || "UTC";
+        const timeZone = interaction.options.getString("tz") || "UTC";
         const notes = interaction.options.getString("notes");
 
         if (name) patch.name = name;
