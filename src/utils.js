@@ -1,14 +1,9 @@
-function safeTruncate(s, max = 1000) {
-  if (!s) return "";
-  const str = String(s);
-  return str.length > max ? str.slice(0, max - 3) + "..." : str;
-}
+const { DateTime } = require("luxon");
 
-function parseReminders() {
+// ENV reminders like "60,15,5"
+function parseRemindersEnv(defaultArr = [60, 15, 5]) {
   const raw = process.env.EVENT_REMINDERS;
-
-  // Default reminders if env is missing/blank
-  if (!raw || !raw.trim()) return [60, 15, 5];
+  if (!raw || !raw.trim()) return [...defaultArr];
 
   const arr = raw
     .split(",")
@@ -16,31 +11,57 @@ function parseReminders() {
     .filter(n => Number.isFinite(n) && n > 0)
     .sort((a, b) => b - a);
 
-  return arr.length ? arr : [60, 15, 5];
+  return arr.length ? arr : [...defaultArr];
 }
 
+function safeTruncate(s, max = 900) {
+  if (!s) return s;
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
 
-// Discord timestamps auto-convert to viewer's local timezone.
-// We show both the auto-local Discord timestamp and explicit UTC.
+// Reset in UTC (game time). Default 00:00 UTC unless env overrides.
+function nextUtcResetTs(now = Date.now()) {
+  const hour = parseInt(process.env.RESET_UTC_HOUR ?? "0", 10);
+  const minute = parseInt(process.env.RESET_UTC_MINUTE ?? "0", 10);
+
+  const dtNow = DateTime.fromMillis(now, { zone: "utc" });
+  let reset = dtNow.set({ hour, minute, second: 0, millisecond: 0 });
+  if (reset.toMillis() <= now) reset = reset.plus({ days: 1 });
+  return reset.toMillis();
+}
+
+// Discord can render local time with <t:unix:F>. We also show explicit UTC text.
 function fmtStartBoth(startTsMs) {
-  const unix = Math.floor(Number(startTsMs) / 1000);
-  const utc = new Date(Number(startTsMs)).toISOString().replace(".000Z", "Z");
-  return `• Local: <t:${unix}:F>  (<t:${unix}:R>)\n• UTC (Game): \`${utc}\``;
+  const unix = Math.floor(startTsMs / 1000);
+  const utc = DateTime.fromMillis(startTsMs, { zone: "utc" }).toFormat("yyyy-LL-dd HH:mm 'UTC'");
+  return `<t:${unix}:F> • **${utc}**`;
 }
 
-function normalizeDowToken(t) {
-  const x = String(t || "").trim().toLowerCase();
-  if (!x) return null;
-  if (["mon", "monday"].includes(x)) return "mon";
-  if (["tue", "tues", "tuesday"].includes(x)) return "tue";
-  if (["wed", "wednesday"].includes(x)) return "wed";
-  if (["thu", "thur", "thurs", "thursday"].includes(x)) return "thu";
-  if (["fri", "friday"].includes(x)) return "fri";
-  if (["sat", "saturday"].includes(x)) return "sat";
-  if (["sun", "sunday"].includes(x)) return "sun";
-  return null;
+// Accepted inputs:
+// - "utcreset"
+// - "utc:YYYY-MM-DD HH:mm"
+// - "YYYY-MM-DD HH:mm" with optional IANA timeZone param
+function parseStartToUtcMillis({ startRaw, timeZone = "UTC" }) {
+  const s = String(startRaw || "").trim();
+  if (!s) throw new Error("Missing start.");
+
+  if (s.toLowerCase() === "utcreset") {
+    return nextUtcResetTs(Date.now());
+  }
+
+  if (s.toLowerCase().startsWith("utc:")) {
+    const raw = s.slice(4).trim();
+    const dt = DateTime.fromFormat(raw, "yyyy-LL-dd HH:mm", { zone: "utc" });
+    if (!dt.isValid) throw new Error("Invalid utc: format. Use utc:YYYY-MM-DD HH:mm");
+    return dt.toMillis();
+  }
+
+  const dt = DateTime.fromFormat(s, "yyyy-LL-dd HH:mm", { zone: timeZone || "UTC" });
+  if (!dt.isValid) throw new Error("Invalid date/time. Use YYYY-MM-DD HH:mm");
+  return dt.toUTC().toMillis();
 }
 
+// "wed,sun" => ["wed","sun"] in canonical order
 function normalizeRepeatDays(input) {
   const map = {
     mon: "mon", monday: "mon",
@@ -64,172 +85,54 @@ function normalizeRepeatDays(input) {
     if (v && !out.includes(v)) out.push(v);
   }
 
-  // canonical order
   const order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
   out.sort((a, b) => order.indexOf(a) - order.indexOf(b));
   return out;
 }
 
-function parseRepeatDays(daysStr) {
-  const toks = String(daysStr || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  const set = new Set();
-  for (const t of toks) {
-    const n = normalizeDowToken(t);
-    if (n) set.add(n);
-  }
-  return [...set];
+// Parse "HH:MM" 24h
+function parseHHMM(hhmm) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(hhmm || "").trim());
+  if (!m) throw new Error("Time must be HH:MM (24-hour).");
+  return `${m[1]}:${m[2]}`;
 }
 
-const DOW_ORDER = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+// Generate next N weeks of occurrences for repeat days at time in tz, anchored by a date
+function generateOccurrences({ anchorDate, timeHHMM, tz, repeatDays, weeksAhead }) {
+  const [hh, mm] = timeHHMM.split(":").map(n => parseInt(n, 10));
+  const anchor = DateTime.fromFormat(anchorDate, "yyyy-LL-dd", { zone: tz });
+  if (!anchor.isValid) throw new Error("Anchor date must be YYYY-MM-DD.");
 
-function dowToIndex(dow) {
-  return DOW_ORDER.indexOf(dow);
-}
+  const end = anchor.plus({ weeks: weeksAhead }).endOf("day");
+  const dayIndex = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
 
-function parseYYYYMMDD(s) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "").trim());
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
-  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-  return { y, mo, d };
-}
+  const targets = repeatDays.map(d => dayIndex[d]).filter(Boolean);
+  if (!targets.length) throw new Error("repeat_days must include at least one valid day (mon..sun).");
 
-function parseHHMM(s) {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || "").trim());
-  if (!m) return null;
-  const hh = Number(m[1]);
-  const mm = Number(m[2]);
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-  return { hh, mm };
-}
+  // start from anchor day 00:00 in tz
+  let cursor = anchor.startOf("day");
+  const out = [];
 
-// Convert a wall-clock time in a timezone to UTC timestamp (ms).
-// This uses Intl to compute offset by formatting the time in that TZ.
-function zonedDateTimeToUtcMs({ y, mo, d, hh, mm, tz }) {
-  const dateUtcGuess = new Date(Date.UTC(y, mo - 1, d, hh, mm, 0));
-
-  // Format the UTC guess in the target timezone, then rebuild as if it were UTC.
-  // Difference between guess and rebuilt yields offset.
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
-
-  const parts = fmt.formatToParts(dateUtcGuess);
-  const get = (type) => parts.find(p => p.type === type)?.value;
-
-  const zy = Number(get("year"));
-  const zmo = Number(get("month"));
-  const zd = Number(get("day"));
-  const zhh = Number(get("hour"));
-  const zmm = Number(get("minute"));
-  const zss = Number(get("second"));
-
-  const rebuiltAsUtc = Date.UTC(zy, zmo - 1, zd, zhh, zmm, zss);
-  const guessAsUtc = dateUtcGuess.getTime();
-  const offsetMs = rebuiltAsUtc - guessAsUtc;
-
-  // Apply offset to align desired wall-clock time in TZ to UTC.
-  return Date.UTC(y, mo - 1, d, hh, mm, 0) - offsetMs;
-}
-
-// Parse start input used by /event create and /event edit
-// Supported:
-// - "utcreset"
-// - "utc:YYYY-MM-DD HH:mm"
-// - "utc:HH:mm" (today UTC)
-// - "local:YYYY-MM-DD HH:mm" (uses server tz/env default)
-// - "YYYY-MM-DD HH:mm" (assumed UTC unless tz provided)
-function parseStartInput(input, { tzDefault = "UTC", resetUtcHour = 0, resetUtcMinute = 0 } = {}) {
-  const raw = String(input || "").trim();
-  if (!raw) return { ok: false, error: "Start time is required." };
-
-  if (raw.toLowerCase() === "utcreset") {
-    // Next reset time in UTC
-    const now = new Date();
-    const y = now.getUTCFullYear();
-    const mo = now.getUTCMonth() + 1;
-    const d = now.getUTCDate();
-    const todayReset = Date.UTC(y, mo - 1, d, resetUtcHour, resetUtcMinute, 0);
-    const startTs = todayReset <= Date.now() ? todayReset + 24 * 60 * 60 * 1000 : todayReset;
-    return { ok: true, startTs };
-  }
-
-  // utc:YYYY-MM-DD HH:mm or utc:HH:mm
-  if (raw.toLowerCase().startsWith("utc:")) {
-    const rest = raw.slice(4).trim();
-    const parts = rest.split(" ").filter(Boolean);
-    if (parts.length === 1) {
-      const hm = parseHHMM(parts[0]);
-      if (!hm) return { ok: false, error: "Invalid utc:HH:mm format." };
-      const now = new Date();
-      const y = now.getUTCFullYear();
-      const mo = now.getUTCMonth() + 1;
-      const d = now.getUTCDate();
-      const startTs = Date.UTC(y, mo - 1, d, hm.hh, hm.mm, 0);
-      return { ok: true, startTs };
+  while (cursor <= end) {
+    if (targets.includes(cursor.weekday)) {
+      const local = cursor.set({ hour: hh, minute: mm, second: 0, millisecond: 0 });
+      out.push(local.toUTC().toMillis());
     }
-    if (parts.length >= 2) {
-      const dt = parseYYYYMMDD(parts[0]);
-      const hm = parseHHMM(parts[1]);
-      if (!dt || !hm) return { ok: false, error: "Invalid utc:YYYY-MM-DD HH:mm format." };
-      const startTs = Date.UTC(dt.y, dt.mo - 1, dt.d, hm.hh, hm.mm, 0);
-      return { ok: true, startTs };
-    }
-    return { ok: false, error: "Invalid utc: format." };
+    cursor = cursor.plus({ days: 1 });
   }
 
-  // local:YYYY-MM-DD HH:mm (uses tzDefault)
-  if (raw.toLowerCase().startsWith("local:")) {
-    const rest = raw.slice(6).trim();
-    const parts = rest.split(" ").filter(Boolean);
-    if (parts.length < 2) return { ok: false, error: "Invalid local:YYYY-MM-DD HH:mm format." };
-    const dt = parseYYYYMMDD(parts[0]);
-    const hm = parseHHMM(parts[1]);
-    if (!dt || !hm) return { ok: false, error: "Invalid local:YYYY-MM-DD HH:mm format." };
-    try {
-      const startTs = zonedDateTimeToUtcMs({ ...dt, ...hm, tz: tzDefault });
-      return { ok: true, startTs };
-    } catch {
-      return { ok: false, error: `Invalid timezone '${tzDefault}'.` };
-    }
-  }
-
-  // Plain "YYYY-MM-DD HH:mm" -> assume UTC
-  const parts = raw.split(" ").filter(Boolean);
-  if (parts.length >= 2) {
-    const dt = parseYYYYMMDD(parts[0]);
-    const hm = parseHHMM(parts[1]);
-    if (!dt || !hm) return { ok: false, error: "Invalid start format. Use utcreset or utc:YYYY-MM-DD HH:mm." };
-    const startTs = Date.UTC(dt.y, dt.mo - 1, dt.d, hm.hh, hm.mm, 0);
-    return { ok: true, startTs };
-  }
-
-  return { ok: false, error: "Invalid start format. Use utcreset or utc:YYYY-MM-DD HH:mm." };
+  // sort ascending
+  out.sort((a, b) => a - b);
+  return out;
 }
 
 module.exports = {
+  parseRemindersEnv,
   safeTruncate,
-  parseReminders,
+  nextUtcResetTs,
   fmtStartBoth,
-  parseRepeatDays,
-  dowToIndex,
-  parseYYYYMMDD,
-  parseHHMM,
-  zonedDateTimeToUtcMs,
-  parseStartInput,
+  parseStartToUtcMillis,
   normalizeRepeatDays,
+  parseHHMM,
+  generateOccurrences,
 };
