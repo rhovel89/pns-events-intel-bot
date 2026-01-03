@@ -515,50 +515,51 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       // ✅ FULLY IMPLEMENTED RECURRING EDIT (this is the fix)
-      if (sub === "edit") {
-        if (requireManageGuild(interaction)) return;
+      if (sub === "list") {
+  await interaction.deferReply({ ephemeral: true });
 
-        const templateId = interaction.options.getInteger("template_id", true);
-        const patch = {};
+  try {
+    const rows = await listActiveEvents(guildId);
 
-        const name = interaction.options.getString("name");
-        const time = interaction.options.getString("time");
-        const tz = interaction.options.getString("time_zone");
-        const repeat = interaction.options.getString("repeat_days");
-        const weeks = interaction.options.getInteger("weeks_ahead");
-        const channel = interaction.options.getChannel("channel");
-        const notes = interaction.options.getString("notes");
-        const mention = interaction.options.getString("mention");
-        const applyFuture = interaction.options.getBoolean("apply_future") || false;
+    if (!rows.length) {
+      await interaction.editReply({ content: "No active events." });
+      return;
+    }
 
-        if (name) patch.name = name;
-        if (time) { parseHhMm(time); patch.time_hhmm = time; }
-        if (tz) patch.tz = tz;
-        if (repeat) patch.repeat_days = normalizeRepeatDays(repeat);
-        if (Number.isFinite(weeks)) patch.weeks_ahead = weeks;
-        if (channel) patch.channel_id = channel.id;
-        if (notes !== null && notes !== undefined) patch.notes = notes;
-        if (mention) patch.mention = normalizeMention(mention);
+    const lines = rows.map(e => {
+      const ts = Number(e.start_ts);
+      const when = Number.isFinite(ts) ? fmtStartBoth(ts) : "**Invalid time**";
+      return `**#${e.id}** • **${e.name}** • ${when} • mention=${e.mention || "none"}`;
+    });
 
-        const edited = await editRecurringTemplate(guildId, templateId, patch);
-        if (!edited.updated) {
-          return interaction.reply({ content: "No changes applied (template not found or no fields provided).", ephemeral: true });
-        }
+    // Chunk into <= 1900 char payloads (safe under 2000)
+    const chunks = [];
+    let buf = "";
 
-        if (applyFuture) {
-          const from = nowMs();
-          const purge = await purgeTemplateEvents(guildId, templateId, from, false);
-          const tRes = await pool.query(`SELECT * FROM recurring_templates WHERE id=$1`, [templateId]);
-          const inserted = await generateTemplateEvents(tRes.rows[0], DateTime.utc().toFormat("yyyy-LL-dd"));
-
-          return interaction.reply({
-            content: `✅ Updated template **#${templateId}**. Purged **${purge.deletedEvents}** future event(s) and regenerated **${inserted}** event(s).`,
-            ephemeral: true
-          });
-        }
-
-        return interaction.reply({ content: `✅ Updated template **#${templateId}**.`, ephemeral: true });
+    for (const line of lines) {
+      if ((buf + line + "\n").length > 1900) {
+        chunks.push(buf.trimEnd());
+        buf = "";
       }
+      buf += line + "\n";
+    }
+    if (buf.trim()) chunks.push(buf.trimEnd());
+
+    // First chunk edits the deferred reply
+    await interaction.editReply({ content: chunks[0] });
+
+    // Remaining chunks as follow-ups
+    for (let i = 1; i < chunks.length; i++) {
+      await interaction.followUp({ content: chunks[i], ephemeral: true });
+    }
+
+    return;
+  } catch (e) {
+    console.error("List command failed:", e);
+    await interaction.editReply({ content: `Error: ${e.message || "Unknown error"}` });
+    return;
+  }
+}
 
       if (sub === "purge") {
         if (requireManageGuild(interaction)) return;
