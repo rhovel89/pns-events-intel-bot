@@ -29,10 +29,12 @@ function nextUtcResetTs(now = Date.now()) {
 
 // Discord local + explicit UTC line
 function fmtStartBoth(startTsMs) {
-  const unix = Math.floor(startTsMs / 1000);
-  const utc = DateTime.fromMillis(startTsMs, { zone: "utc" }).toFormat("yyyy-LL-dd HH:mm 'UTC'");
-  // <t:unix:F> shows each user's local time automatically
-  return `<t:${unix}:F> • **${utc}**`;
+  const ms = Number(startTsMs);
+  if (!Number.isFinite(ms)) return "**Invalid time**";
+
+  const unix = Math.floor(ms / 1000);
+  const utc = DateTime.fromMillis(ms, { zone: "utc" }).toFormat("yyyy-LL-dd HH:mm 'UTC'");
+  return `<t:${unix}:F>  •  **${utc}**`;
 }
 
 // Parse start input for manual events
