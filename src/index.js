@@ -1,4 +1,5 @@
 require("dotenv").config();
+
 const {
   Client,
   GatewayIntentBits,
@@ -9,6 +10,7 @@ const {
 
 const { DateTime } = require("luxon");
 const { makePool, initDb } = require("./db");
+
 const {
   parseReminders,
   safeTruncate,
@@ -27,8 +29,10 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
+// Postgres pool (Railway: DATABASE_URL)
 const pool = makePool();
 
+// Discord client (only need Guilds for slash commands)
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
@@ -40,6 +44,7 @@ function nowMs() {
   return Date.now();
 }
 
+// Fetch text channel safely
 async function fetchTextChannel(guildId, channelId) {
   try {
     const ch = await client.channels.fetch(channelId);
@@ -51,13 +56,17 @@ async function fetchTextChannel(guildId, channelId) {
   }
 }
 
+// Permission gate
 function requireManageGuild(interaction) {
   const ok = interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild);
   if (!ok) {
-    return interaction.reply({ content: "You need **Manage Server** permission for this action.", ephemeral: true });
+    interaction.reply({ content: "You need **Manage Server** permission for this action.", ephemeral: true }).catch(() => {});
+    return true;
   }
-  return null;
+  return false;
 }
+
+// -------------------- EVENTS --------------------
 
 async function createEventReminders(eventId, startTs, remindersArr) {
   const rems = (remindersArr || []).map(m => ({
@@ -90,7 +99,17 @@ async function createOneTimeEvent({
     `INSERT INTO events (guild_id, channel_id, name, start_ts, notes, is_active, created_by, created_ts, mention, recurring_template_id)
      VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9)
      RETURNING id`,
-    [guildId, channelId, name, startTs, notes ?? null, createdBy ?? null, createdTs, mention ?? "none", recurringTemplateId]
+    [
+      guildId,
+      channelId,
+      name,
+      startTs,
+      notes ?? null,
+      createdBy ?? null,
+      createdTs,
+      mention ?? "none",
+      recurringTemplateId
+    ]
   );
 
   const eventId = res.rows[0].id;
@@ -125,7 +144,7 @@ async function endEvent(guildId, eventId) {
 }
 
 async function editEvent(guildId, eventId, patch) {
-  // Build dynamic update
+  // Dynamic update builder
   const fields = [];
   const values = [];
   let i = 1;
@@ -138,14 +157,15 @@ async function editEvent(guildId, eventId, patch) {
   }
   if (!fields.length) return { updated: false, row: null };
 
-  values.push(guildId);
-  values.push(eventId);
+  values.push(nowMs(), guildId, eventId);
 
   const res = await pool.query(
-    `UPDATE events SET ${fields.join(", ")}, updated_ts = COALESCE(updated_ts, $${i}) 
+    `UPDATE events
+     SET ${fields.join(", ")},
+         updated_ts=$${i}
      WHERE guild_id=$${i + 1} AND id=$${i + 2}
      RETURNING id, name, start_ts, notes, mention, channel_id`,
-    [...values, nowMs(), guildId, eventId]
+    values
   );
 
   return { updated: res.rowCount > 0, row: res.rowCount ? res.rows[0] : null };
@@ -167,13 +187,28 @@ async function createRecurringTemplate({
   createdBy
 }) {
   const createdTs = nowMs();
+
   const res = await pool.query(
     `INSERT INTO recurring_templates
      (guild_id, channel_id, name, tz, time_hhmm, repeat_days, notes, reminders, weeks_ahead, is_enabled, mention, created_by, created_ts)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11,$12)
      RETURNING id`,
-    [guildId, channelId, name, tz, timeHhmm, repeatDaysArr, notes ?? null, remindersStr ?? null, weeksAhead, mention ?? "none", createdBy ?? null, createdTs]
+    [
+      guildId,
+      channelId,
+      name,
+      tz,
+      timeHhmm,
+      repeatDaysArr,
+      notes ?? null,
+      remindersStr ?? null,
+      weeksAhead,
+      mention ?? "none",
+      createdBy ?? null,
+      createdTs
+    ]
   );
+
   return res.rows[0].id;
 }
 
@@ -250,22 +285,17 @@ async function generateTemplateEvents(template, anchorDateStr) {
   const startRangeUtc = DateTime.utc();
   const endRangeUtc = DateTime.utc().plus({ days: weeksAhead * 7 });
 
-  // We generate candidate dates from anchor..endRange
-  // but we only insert those >= now and within window.
   let inserted = 0;
 
-  // iterate day-by-day
   for (let d = anchor; d <= endRangeUtc; d = d.plus({ days: 1 })) {
     const weekday = d.weekday; // 1..7
     const isWanted = repeatDays.some(x => dayToLuxonWeekday(x) === weekday);
     if (!isWanted) continue;
 
-    // Build start in tz at that date+time, then convert to UTC milliseconds
     const local = DateTime.fromObject(
       { year: d.year, month: d.month, day: d.day, hour: hh, minute: mm, second: 0, millisecond: 0 },
       { zone: tz }
     );
-
     if (!local.isValid) continue;
 
     const startUtc = local.toUTC();
@@ -274,9 +304,8 @@ async function generateTemplateEvents(template, anchorDateStr) {
     if (startTs < startRangeUtc.toMillis()) continue;
     if (startTs > endRangeUtc.toMillis()) continue;
 
-    // Insert event (dedup by unique index)
     try {
-      const eventId = await createOneTimeEvent({
+      await createOneTimeEvent({
         guildId: template.guild_id,
         channelId: template.channel_id,
         name: template.name,
@@ -287,11 +316,8 @@ async function generateTemplateEvents(template, anchorDateStr) {
         recurringTemplateId: template.id
       });
       inserted += 1;
-      // event reminders created in createOneTimeEvent
-      void eventId;
-    } catch (e) {
-      // Duplicate insert will throw; ignore
-      // (Also ignore any transient errors)
+    } catch {
+      // Duplicate insert ignored (unique index in db.js)
     }
   }
 
@@ -301,7 +327,6 @@ async function generateTemplateEvents(template, anchorDateStr) {
 async function purgeTemplateEvents(guildId, templateId, fromTs, all) {
   const from = all ? 0 : fromTs;
 
-  // delete reminders/rsvps tied to those events first, then events
   const idsRes = await pool.query(
     `SELECT id FROM events
      WHERE guild_id=$1 AND recurring_template_id=$2 AND start_ts >= $3`,
@@ -326,13 +351,10 @@ async function deleteTemplate(guildId, templateId) {
   return res.rowCount ? res.rows[0] : null;
 }
 
-// Background generator: ensures future events exist for enabled templates
+// Background generator tick
 async function recurringTick() {
   try {
-    // For each enabled template, generate using today as anchor (safe because dedup index)
-    const res = await pool.query(
-      `SELECT * FROM recurring_templates WHERE is_enabled=TRUE`
-    );
+    const res = await pool.query(`SELECT * FROM recurring_templates WHERE is_enabled=TRUE`);
     for (const t of res.rows) {
       await generateTemplateEvents(t, DateTime.utc().toFormat("yyyy-LL-dd"));
     }
@@ -345,7 +367,6 @@ async function recurringTick() {
 
 async function remindersTick() {
   try {
-    // Find reminders that should fire now
     const res = await pool.query(
       `SELECT er.id as reminder_id, er.event_id, er.remind_at_ts, e.guild_id, e.channel_id, e.name, e.start_ts, e.notes, e.mention
        FROM event_reminders er
@@ -361,7 +382,6 @@ async function remindersTick() {
     for (const row of res.rows) {
       const ch = await fetchTextChannel(row.guild_id, row.channel_id);
       if (!ch) {
-        // mark fired to prevent endless retries
         await pool.query(`UPDATE event_reminders SET fired=TRUE WHERE id=$1`, [row.reminder_id]);
         continue;
       }
@@ -377,12 +397,12 @@ async function remindersTick() {
         .setFooter({ text: `Event ID: ${row.event_id}` });
 
       const mention = normalizeMention(row.mention || process.env.DEFAULT_MENTION || "none");
-      const content = mentionText(mention);
 
       await ch.send({
-        content,
+        content: mentionText(mention),
         embeds: [embed],
-        allowedMentions: { parse: mention === "everyone" ? ["everyone"] : mention === "here" ? ["everyone"] : [] }
+        // allow @everyone/@here only when chosen
+        allowedMentions: { parse: mention === "everyone" || mention === "here" ? ["everyone"] : [] }
       });
 
       await pool.query(`UPDATE event_reminders SET fired=TRUE WHERE id=$1`, [row.reminder_id]);
@@ -400,18 +420,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   try {
     const guildId = interaction.guildId;
-    if (!guildId) return interaction.reply({ content: "This command must be used in a server.", ephemeral: true });
+    if (!guildId) {
+      return interaction.reply({ content: "This command must be used in a server.", ephemeral: true });
+    }
 
-    // Subcommand group?
     const group = interaction.options.getSubcommandGroup(false);
     const sub = interaction.options.getSubcommand();
 
-    // -------------------- RECURRING GROUP --------------------
+    // ===== RECURRING GROUP =====
     if (group === "recurring") {
+
       if (sub === "create") {
-        // permission gate: recurring creation typically admin-level
-        const denied = requireManageGuild(interaction);
-        if (denied) return;
+        if (requireManageGuild(interaction)) return;
 
         const name = interaction.options.getString("name", true);
         const date = interaction.options.getString("date", true);
@@ -427,8 +447,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const mention = normalizeMention(interaction.options.getString("mention") || process.env.DEFAULT_MENTION || "none");
         const repeatDaysArr = normalizeRepeatDays(repeat_days);
 
-        // store as HH:MM
-        parseHhMm(time); // validate
+        parseHhMm(time); // validate time
+
         const templateId = await createRecurringTemplate({
           guildId,
           channelId,
@@ -443,7 +463,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           createdBy: interaction.user.id
         });
 
-        // generate immediately (anchored on provided date)
         const tRes = await pool.query(`SELECT * FROM recurring_templates WHERE id=$1`, [templateId]);
         const inserted = await generateTemplateEvents(tRes.rows[0], date);
 
@@ -465,20 +484,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "disable" || sub === "enable") {
-        const denied = requireManageGuild(interaction);
-        if (denied) return;
+        if (requireManageGuild(interaction)) return;
 
         const templateId = interaction.options.getInteger("template_id", true);
         const enabled = sub === "enable";
         const row = await setTemplateEnabled(guildId, templateId, enabled);
         if (!row) return interaction.reply({ content: "Template not found.", ephemeral: true });
 
-        return interaction.reply({ content: `✅ Template **#${row.id} ${row.name}** is now **${row.is_enabled ? "ENABLED" : "DISABLED"}**.`, ephemeral: true });
+        return interaction.reply({
+          content: `✅ Template **#${row.id} ${row.name}** is now **${row.is_enabled ? "ENABLED" : "DISABLED"}**.`,
+          ephemeral: true
+        });
       }
 
+      // ✅ FULLY IMPLEMENTED RECURRING EDIT (this is the fix)
       if (sub === "edit") {
-        const denied = requireManageGuild(interaction);
-        if (denied) return;
+        if (requireManageGuild(interaction)) return;
 
         const templateId = interaction.options.getInteger("template_id", true);
         const patch = {};
@@ -503,14 +524,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (mention) patch.mention = normalizeMention(mention);
 
         const edited = await editRecurringTemplate(guildId, templateId, patch);
-        if (!edited.updated) return interaction.reply({ content: "No changes applied (template not found or no fields provided).", ephemeral: true });
+        if (!edited.updated) {
+          return interaction.reply({ content: "No changes applied (template not found or no fields provided).", ephemeral: true });
+        }
 
-        // Optional apply to future: purge future and regenerate
         if (applyFuture) {
           const from = nowMs();
           const purge = await purgeTemplateEvents(guildId, templateId, from, false);
           const tRes = await pool.query(`SELECT * FROM recurring_templates WHERE id=$1`, [templateId]);
           const inserted = await generateTemplateEvents(tRes.rows[0], DateTime.utc().toFormat("yyyy-LL-dd"));
+
           return interaction.reply({
             content: `✅ Updated template **#${templateId}**. Purged **${purge.deletedEvents}** future event(s) and regenerated **${inserted}** event(s).`,
             ephemeral: true
@@ -521,8 +544,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "purge") {
-        const denied = requireManageGuild(interaction);
-        if (denied) return;
+        if (requireManageGuild(interaction)) return;
 
         const templateId = interaction.options.getInteger("template_id", true);
         const range = interaction.options.getString("range", true);
@@ -533,6 +555,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           : (fromStr ? parseYyyyMmDd(fromStr).toMillis() : nowMs());
 
         const purge = await purgeTemplateEvents(guildId, templateId, fromTs, range === "all");
+
         return interaction.reply({
           content: `✅ Purged **${purge.deletedEvents}** generated event(s) for template **#${templateId}** (template kept).`,
           ephemeral: true
@@ -540,18 +563,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "delete") {
-        const denied = requireManageGuild(interaction);
-        if (denied) return;
+        if (requireManageGuild(interaction)) return;
 
         const templateId = interaction.options.getInteger("template_id", true);
         const scope = interaction.options.getString("scope", true);
         const fromStr = interaction.options.getString("from");
 
         if (scope === "template_only") {
-          // safest: disable, then delete template row (no event deletion)
           await setTemplateEnabled(guildId, templateId, false);
           const del = await deleteTemplate(guildId, templateId);
           if (!del) return interaction.reply({ content: "Template not found.", ephemeral: true });
+
           return interaction.reply({ content: `✅ Deleted template **#${del.id} ${del.name}** (events left intact).`, ephemeral: true });
         }
 
@@ -559,8 +581,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const fromTs = fromStr ? parseYyyyMmDd(fromStr).toMillis() : nowMs();
           const purge = await purgeTemplateEvents(guildId, templateId, fromTs, false);
           await setTemplateEnabled(guildId, templateId, false);
+
           const del = await deleteTemplate(guildId, templateId);
           if (!del) return interaction.reply({ content: "Template not found.", ephemeral: true });
+
           return interaction.reply({
             content: `✅ Deleted template **#${del.id} ${del.name}** and removed **${purge.deletedEvents}** future generated event(s).`,
             ephemeral: true
@@ -570,8 +594,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (scope === "all") {
           const purge = await purgeTemplateEvents(guildId, templateId, 0, true);
           await setTemplateEnabled(guildId, templateId, false);
+
           const del = await deleteTemplate(guildId, templateId);
           if (!del) return interaction.reply({ content: "Template not found.", ephemeral: true });
+
           return interaction.reply({
             content: `✅ Deleted template **#${del.id} ${del.name}** and removed **${purge.deletedEvents}** generated event(s).`,
             ephemeral: true
@@ -584,7 +610,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "Unknown recurring subcommand.", ephemeral: true });
     }
 
-    // -------------------- ONE-TIME COMMANDS --------------------
+    // ===== ONE-TIME COMMANDS =====
+
     if (sub === "create") {
       const name = interaction.options.getString("name", true);
       const startRaw = interaction.options.getString("start", true);
@@ -595,6 +622,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const mention = normalizeMention(interaction.options.getString("mention") || process.env.DEFAULT_MENTION || "none");
 
       const startTs = parseStartToUtcMillis({ startRaw, timeZone: tz });
+
       const eventId = await createOneTimeEvent({
         guildId,
         channelId,
@@ -616,7 +644,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ].join("")
         );
 
-      // Post confirmation into channel
       const ch = await fetchTextChannel(guildId, channelId);
       if (ch) await ch.send({ embeds: [embed] });
 
@@ -632,8 +659,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (sub === "end") {
-      const denied = requireManageGuild(interaction);
-      if (denied) return;
+      if (requireManageGuild(interaction)) return;
 
       const eventId = interaction.options.getInteger("event_id", true);
       const ended = await endEvent(guildId, eventId);
@@ -643,8 +669,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (sub === "edit") {
-      const denied = requireManageGuild(interaction);
-      if (denied) return;
+      if (requireManageGuild(interaction)) return;
 
       const eventId = interaction.options.getInteger("event_id", true);
       const patch = {};
@@ -696,9 +721,8 @@ client.once(Events.ClientReady, async () => {
     process.exit(1);
   }
 
-  // Start schedulers
   if (!reminderInterval) reminderInterval = setInterval(remindersTick, 15 * 1000);
-  if (!recurringInterval) recurringInterval = setInterval(recurringTick, 10 * 60 * 1000); // every 10 minutes
+  if (!recurringInterval) recurringInterval = setInterval(recurringTick, 10 * 60 * 1000);
 
   console.log("Schedulers started.");
 });
