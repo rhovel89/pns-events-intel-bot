@@ -122,7 +122,7 @@ async function createOneTimeEvent({
 
 async function listActiveEvents(guildId) {
   const res = await pool.query(
-    `SELECT id, name, start_ts, notes, mention
+    `SELECT id, name, start_ts::bigint as start_ts, notes, mention
      FROM events
      WHERE guild_id=$1 AND is_active=TRUE
      ORDER BY start_ts ASC
@@ -473,15 +473,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "list") {
-        const rows = await listRecurringTemplates(guildId);
-        if (!rows.length) return interaction.reply({ content: "No recurring templates found.", ephemeral: true });
+  // Prevent "application did not respond" if DB takes >3s
+  await interaction.deferReply({ ephemeral: true });
 
-        const lines = rows.map(r =>
-          `**#${r.id}** • ${r.is_enabled ? "✅" : "⛔"} **${r.name}** • ${r.tz} ${r.time_hhmm} • [${(r.repeat_days || []).join(", ")}] • weeks_ahead=${r.weeks_ahead} • mention=${r.mention || "none"} • channel=<#${r.channel_id}>`
-        );
+  try {
+    const rows = await listActiveEvents(guildId);
 
-        return interaction.reply({ content: lines.slice(0, 20).join("\n"), ephemeral: true });
-      }
+    if (!rows.length) {
+      return interaction.editReply({ content: "No active events." });
+    }
+
+    const lines = rows.map(e => {
+      // start_ts may come back as a string from Postgres
+      const ts = Number(e.start_ts);
+      const when = Number.isFinite(ts) ? fmtStartBoth(ts) : "**Invalid time**";
+      return `**#${e.id}** • **${e.name}** • ${when} • mention=${e.mention || "none"}`;
+    });
+
+    // Discord has message length limits; keep it safe
+    const msg = lines.join("\n").slice(0, 1900);
+    return interaction.editReply({ content: msg });
+  } catch (e) {
+    console.error("List command failed:", e);
+    return interaction.editReply({ content: `Error: ${e.message || "Unknown error"}` });
+  }
+}
+
 
       if (sub === "disable" || sub === "enable") {
         if (requireManageGuild(interaction)) return;
