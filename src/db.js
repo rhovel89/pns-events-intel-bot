@@ -99,6 +99,18 @@ async function initDb(pool) {
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS recurring_template_id INT;`);
   await pool.query(`ALTER TABLE recurring_templates ADD COLUMN IF NOT EXISTS mention TEXT DEFAULT 'none';`);
 
+  // DELIVERY_V2: idempotent delivery claims, retries and traceability.
+  // Null claim_until / next_attempt_ts mean immediately eligible when due.
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS claim_token TEXT;`);
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS claim_until BIGINT;`);
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS next_attempt_ts BIGINT;`);
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS last_error TEXT;`);
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS sent_at BIGINT;`);
+  await pool.query(`ALTER TABLE event_reminders ADD COLUMN IF NOT EXISTS sent_message_id TEXT;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS event_reminders_delivery_v2_idx
+    ON event_reminders (remind_at_ts, next_attempt_ts) WHERE fired=FALSE;`);
+
   // Useful index/uniqueness: prevent duplicate generated events for same template+start_ts
   await pool.query(`
     DO $$

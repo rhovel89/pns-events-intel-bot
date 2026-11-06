@@ -12,6 +12,7 @@ const {
 } = require("discord.js");
 
 const { DateTime } = require("luxon");
+const { randomUUID } = require("node:crypto");
 const { makePool, initDb } = require("./db");
 
 const {
@@ -417,51 +418,104 @@ async function recurringTick() {
 
 // -------------------- REMINDERS --------------------
 
+// DELIVERY_V2: atomic claims, bounded leases, delayed retries, and send acknowledgments.
+// A send can succeed before its ack reaches Postgres; therefore retries remain
+// AT-LEAST-ONCE, not exactly-once. Discord does not provide an idempotency key here.
+const CLAIM_LEASE_MS = 120000;
+const CLAIM_BATCH_SIZE = 1;
+let reminderTickInProgress = false;
+
+async function claimDueReminders() {
+  const token = randomUUID();
+  const now = nowMs();
+  const result = await pool.query(`
+    WITH due AS (
+      SELECT er.id
+      FROM event_reminders er
+      JOIN events e ON e.id=er.event_id
+      WHERE er.fired=FALSE AND e.is_active=TRUE
+        AND er.remind_at_ts <= $1
+        AND (er.next_attempt_ts IS NULL OR er.next_attempt_ts <= $1)
+        AND (er.claim_until IS NULL OR er.claim_until <= $1)
+      ORDER BY er.remind_at_ts, er.id
+      FOR UPDATE OF er SKIP LOCKED
+      LIMIT $2
+    )
+    UPDATE event_reminders er
+       SET claim_token=$3, claim_until=$4, attempts=er.attempts+1
+      FROM due WHERE er.id=due.id
+    RETURNING er.id AS reminder_id, er.event_id, er.remind_at_ts, er.attempts
+  `, [now, CLAIM_BATCH_SIZE, token, now + CLAIM_LEASE_MS]);
+  return { token, rows: result.rows };
+}
+
+async function markDelivered(row, token, messageId) {
+  const result = await pool.query(`
+    UPDATE event_reminders
+       SET fired=TRUE, sent_at=$3, sent_message_id=$4,
+           claim_token=NULL, claim_until=NULL, next_attempt_ts=NULL, last_error=NULL
+     WHERE id=$1 AND claim_token=$2 AND fired=FALSE
+  `, [row.reminder_id, token, nowMs(), messageId || null]);
+  if (result.rowCount !== 1) {
+    console.warn(`Reminder ${row.reminder_id} send succeeded, but delivery acknowledgement lost claim ownership; duplicate-risk review needed.`);
+  }
+}
+
+async function markDeliveryFailure(row, token, err) {
+  const message = String(err?.message || err || 'Unknown delivery failure').slice(0, 400);
+  const attempts = Math.max(1, Number(row.attempts) || 1);
+  const backoff = Math.min(600000, 30000 * Math.pow(2, Math.min(5, attempts - 1)));
+  await pool.query(`
+    UPDATE event_reminders
+       SET claim_token=NULL, claim_until=NULL, last_error=$3, next_attempt_ts=$4
+     WHERE id=$1 AND claim_token=$2 AND fired=FALSE
+  `, [row.reminder_id, token, message, nowMs() + backoff]);
+  console.warn(`Reminder ${row.reminder_id} delivery attempt ${attempts} failed: ${message}`);
+}
+
 async function remindersTick() {
+  if (reminderTickInProgress) return;
+  reminderTickInProgress = true;
   try {
-    const res = await pool.query(
-      `SELECT er.id as reminder_id, er.event_id, er.remind_at_ts, e.guild_id, e.channel_id, e.name, e.start_ts, e.notes, e.mention
-       FROM event_reminders er
-       JOIN events e ON e.id = er.event_id
-       WHERE er.fired=FALSE
-         AND e.is_active=TRUE
-         AND er.remind_at_ts <= $1
-       ORDER BY er.remind_at_ts ASC
-       LIMIT 25`,
-      [nowMs()]
-    );
-
-    for (const row of res.rows) {
-      const ch = await fetchTextChannel(row.guild_id, row.channel_id);
-      if (!ch) {
-        // Do not silently discard a reminder if the channel is temporarily inaccessible.
-        console.warn(`Reminder ${row.reminder_id} cannot access channel ${row.channel_id}`);
-        continue;
+    const { token, rows } = await claimDueReminders();
+    for (const row of rows) {
+      try {
+        // Fetch current event data, scoped by the same event ID; an edited/ended
+        // event may no longer be eligible after it was claimed.
+        const latest = await pool.query(`
+          SELECT e.guild_id, e.channel_id, e.name, e.start_ts, e.notes, e.mention,
+                 e.is_active, er.fired, er.remind_at_ts
+          FROM event_reminders er JOIN events e ON e.id=er.event_id
+          WHERE er.id=$1 AND er.claim_token=$2
+        `, [row.reminder_id, token]);
+        if (!latest.rowCount || !latest.rows[0].is_active || latest.rows[0].fired) continue;
+        const event = latest.rows[0];
+        // A different event edit can move or replace the reminder after the claim.
+        if (Number(event.remind_at_ts) !== Number(row.remind_at_ts)) continue;
+        const ch = await fetchTextChannel(event.guild_id, event.channel_id);
+        if (!ch) throw new Error(`Reminder channel inaccessible: ${event.channel_id}`);
+        const embed = new EmbedBuilder()
+          .setTitle(`⏰ Event Reminder: ${event.name}`)
+          .setDescription([
+            `**Starts:** ${fmtStartBoth(event.start_ts)}`,
+            event.notes ? `**Notes:** ${safeTruncate(event.notes)}` : ''
+          ].filter(Boolean).join('\n'))
+          .setFooter({ text: `Event ID: ${row.event_id}` });
+        const mention = normalizeMention(event.mention || process.env.DEFAULT_MENTION || 'none');
+        const msg = await ch.send({
+          content: mentionText(mention), embeds: [embed],
+          allowedMentions: { parse: mention === 'everyone' || mention === 'here' ? ['everyone'] : [] }
+        });
+        await markDelivered(row, token, msg?.id);
+      } catch (e) {
+        try { await markDeliveryFailure(row, token, e); }
+        catch (dbErr) { console.error(`Reminder ${row.reminder_id} retry metadata error:`, dbErr); }
       }
-
-      const embed = new EmbedBuilder()
-        .setTitle(`⏰ Event Reminder: ${row.name}`)
-        .setDescription(
-          [
-            `**Starts:** ${fmtStartBoth(row.start_ts)}`,
-            row.notes ? `**Notes:** ${safeTruncate(row.notes)}` : ""
-          ].filter(Boolean).join("\n")
-        )
-        .setFooter({ text: `Event ID: ${row.event_id}` });
-
-      const mention = normalizeMention(row.mention || process.env.DEFAULT_MENTION || "none");
-
-      await ch.send({
-        content: mentionText(mention),
-        embeds: [embed],
-        // allow @everyone/@here only when chosen
-        allowedMentions: { parse: mention === "everyone" || mention === "here" ? ["everyone"] : [] }
-      });
-
-      await pool.query(`UPDATE event_reminders SET fired=TRUE WHERE id=$1`, [row.reminder_id]);
     }
   } catch (e) {
-    console.error("Reminders tick error:", e);
+    console.error('Reminders tick error:', e);
+  } finally {
+    reminderTickInProgress = false;
   }
 }
 
@@ -538,8 +592,20 @@ async function dashboardContent(guildId, guildName, view) {
       FROM event_reminders er JOIN events e ON e.id=er.event_id
       WHERE e.guild_id=$1 AND e.is_active=TRUE AND er.fired=FALSE
       ORDER BY er.remind_at_ts ASC LIMIT 6`, [guildId]);
+    // DELIVERY_V2 monitor: only this guild, and only active events.
+    const delivery = await pool.query(`
+      SELECT COUNT(*) FILTER (WHERE er.fired=FALSE AND er.claim_until > $2)::int AS leased,
+             COUNT(*) FILTER (WHERE er.fired=FALSE AND er.last_error IS NOT NULL)::int AS retrying,
+             COUNT(*) FILTER (WHERE er.fired=FALSE AND er.next_attempt_ts > $2)::int AS deferred,
+             COALESCE(MAX(er.attempts),0)::int AS max_attempts
+      FROM event_reminders er JOIN events e ON e.id=er.event_id
+      WHERE e.guild_id=$1 AND e.is_active=TRUE
+    `, [guildId, nowMs()]);
     const c = counts.rows[0];
+    const q = delivery.rows[0];
     embed.addFields(
+      { name: "Delivery V2 • claim and retry health", value:
+        `Leased: **${q.leased}** • Retrying: **${q.retrying}** • Deferred: **${q.deferred}** • Max attempts: **${q.max_attempts}**` },
       { name: "Future-event reminder counts", value: `Pending: **${c.pending}** • Fired: **${c.fired}** • Due/overdue: **${c.due}**` },
       { name: "Next pending reminders", value: due.rows.length
         ? due.rows.map(r => `Event #${r.event_id} • ${safeTruncate(r.name, 65)} • <t:${Math.floor(Number(r.remind_at_ts)/1000)}:R> • <#${r.channel_id}>`).join("\n").slice(0, 1000)
