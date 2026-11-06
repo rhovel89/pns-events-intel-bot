@@ -14,6 +14,7 @@ const {
 const { DateTime } = require("luxon");
 const { randomUUID } = require("node:crypto");
 const { makePool, initDb } = require("./db");
+const { createCalendar } = require("./calendar");
 
 const {
   parseReminders,
@@ -97,6 +98,9 @@ async function chooseGuildDefaults(guildId, interaction) {
   if (!dest) throw new Error("Configured reminder channel is inaccessible. Use /event setup to choose a valid channel.");
   return { tz, channelId };
 }
+
+// CALENDAR_V1: member-facing, read-only, per-guild event calendar.
+const calendar = createCalendar({ pool, getGuildSettings });
 
 // -------------------- EVENTS --------------------
 
@@ -629,6 +633,12 @@ async function dashboardContent(guildId, guildName, view) {
 // -------------------- INTERACTIONS --------------------
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  // CALENDAR_V1: only the original viewer can navigate the ephemeral calendar.
+  if ((interaction.isButton() || interaction.isStringSelectMenu()) &&
+      interaction.customId.startsWith("713cal|")) {
+    await calendar.handleComponent(interaction);
+    return;
+  }
   // ADMIN_DASHBOARD_V1 buttons: private, read-only, no cross-guild access.
   if (interaction.isButton() && interaction.customId.startsWith(DASH_PREFIX)) {
     try {
@@ -663,6 +673,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "Channel must belong to this server.", ephemeral: true });
     }
 
+    // CALENDAR_V1: no Manage Server privilege needed for read-only views.
+    if (sub === "calendar") {
+      await interaction.deferReply({ ephemeral: true });
+      return interaction.editReply(await calendar.renderCalendar(
+        guildId, interaction.user.id,
+        interaction.options.getString("view") || "week",
+        interaction.options.getString("date")
+      ));
+    }
+
     // ADMIN_DASHBOARD_V1 requires Manage Server; controls only display data.
     if (sub === "dashboard") {
       if (requireManageGuild(interaction)) return;
@@ -677,6 +697,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           "**713 Event Reminders — Alliance Guide**",
           "`/event setup` — view this server's time zone and default reminder channel",
           "`/event setup time_zone:America/Chicago channel:#reminders` — save server defaults (Manage Server required)",
+          "`/event calendar` — private interactive day, week or month calendar (all members)",
           "`/event quick` — create an event using separate date and time fields",
           "`/event create` — advanced event with custom start/time zone",
           "`/event list`, `/event edit`, `/event end` — manage one-time events",

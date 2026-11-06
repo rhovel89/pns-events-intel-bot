@@ -24,6 +24,19 @@ const commands = [
     .setName("event")
     .setDescription("Create/manage events (UTC game time + reminders + recurring)")
 
+    // CALENDAR_V1: read-only calendar, available to all server members.
+    .addSubcommand(sc =>
+      sc.setName("calendar")
+        .setDescription("View your alliance event calendar with interactive navigation")
+        .addStringOption(o => o.setName("view").setDescription("Day, week or month (default week)")
+          .addChoices(
+            { name: "Day", value: "day" },
+            { name: "Week", value: "week" },
+            { name: "Month", value: "month" }
+          ))
+        .addStringOption(o => o.setName("date").setDescription("Optional YYYY-MM-DD; defaults to today"))
+    )
+
     // ADMIN_DASHBOARD_V1: ephemeral administrator overview and read-only buttons.
     .addSubcommand(sc =>
       sc.setName("dashboard")
