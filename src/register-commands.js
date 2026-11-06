@@ -24,6 +24,27 @@ const commands = [
     .setName("event")
     .setDescription("Create/manage events (UTC game time + reminders + recurring)")
 
+    .addSubcommand(sc =>
+      sc.setName("help")
+        .setDescription("How to configure this alliance and schedule events")
+    )
+
+    .addSubcommand(sc =>
+      sc.setName("setup")
+        .setDescription("View or set this server's default time zone and reminder channel")
+        .addStringOption(o => o.setName("time_zone").setDescription("IANA zone, e.g. America/Chicago or UTC"))
+        .addChannelOption(o => o.setName("channel").setDescription("Default reminder channel").addChannelTypes(ChannelType.GuildText))
+    )
+
+    .addSubcommand(sc =>
+      sc.setName("quick")
+        .setDescription("Quick event: name, date, time; uses this server's defaults")
+        .addStringOption(o => o.setName("name").setDescription("Event name").setRequired(true))
+        .addStringOption(o => o.setName("date").setDescription("YYYY-MM-DD").setRequired(true))
+        .addStringOption(o => o.setName("time").setDescription("HH:mm (24-hour) in server's time zone").setRequired(true))
+        .addStringOption(o => o.setName("notes").setDescription("Optional notes"))
+    )
+
     // One-time event create
     .addSubcommand(sc =>
       sc.setName("create")

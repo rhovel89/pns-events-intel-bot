@@ -82,6 +82,16 @@ async function initDb(pool) {
     );
   `);
 
+  // ALLIANCE_SETUP_V1: per-server defaults; existing event rows remain untouched.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guild_settings (
+      guild_id TEXT PRIMARY KEY,
+      time_zone TEXT NOT NULL DEFAULT 'UTC',
+      default_channel_id TEXT,
+      updated_ts BIGINT NOT NULL
+    );
+  `);
+
   // Safety upgrades (in case tables existed older)
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS mention TEXT DEFAULT 'none';`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS recurring_template_id INT;`);

@@ -66,6 +66,34 @@ function requireManageGuild(interaction) {
   return false;
 }
 
+// ALLIANCE_SETUP_V1: defaults are scoped to the invoking Discord guild.
+async function getGuildSettings(guildId) {
+  const result = await pool.query(
+    `SELECT time_zone, default_channel_id FROM guild_settings WHERE guild_id=$1`,
+    [guildId]
+  );
+  return result.rows[0] || { time_zone: "UTC", default_channel_id: null };
+}
+
+function validZone(zone) {
+  const z = (zone || "").trim();
+  if (!z || !DateTime.local().setZone(z).isValid) {
+    throw new Error("Invalid time zone. Use an IANA time zone such as America/Chicago or UTC.");
+  }
+  return z;
+}
+
+async function chooseGuildDefaults(guildId, interaction) {
+  const cfg = await getGuildSettings(guildId);
+  const tz = validZone(interaction.options.getString("time_zone") || cfg.time_zone);
+  const supplied = interaction.options.getChannel("channel");
+  const channelId = supplied?.id || cfg.default_channel_id || interaction.channelId;
+  // Settings may refer to a deleted channel, but never to a channel in another guild.
+  const dest = await fetchTextChannel(guildId, channelId);
+  if (!dest) throw new Error("Configured reminder channel is inaccessible. Use /event setup to choose a valid channel.");
+  return { tz, channelId };
+}
+
 // -------------------- EVENTS --------------------
 
 async function createEventReminders(eventId, startTs, remindersArr) {
@@ -392,8 +420,8 @@ async function remindersTick() {
         .setDescription(
           [
             `**Starts:** ${fmtStartBoth(row.start_ts)}`,
-            row.notes ? `\n**Notes:** ${safeTruncate(row.notes)}` : ""
-          ].join("")
+            row.notes ? `**Notes:** ${safeTruncate(row.notes)}` : ""
+          ].filter(Boolean).join("\n")
         )
         .setFooter({ text: `Event ID: ${row.event_id}` });
 
@@ -433,6 +461,83 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "Channel must belong to this server.", ephemeral: true });
     }
 
+    // Setup and help are read-only unless explicitly updating this guild's settings.
+    if (sub === "help") {
+      return interaction.reply({
+        content: [
+          "**713 Event Reminders — Alliance Guide**",
+          "`/event setup` — view this server's time zone and default reminder channel",
+          "`/event setup time_zone:America/Chicago channel:#reminders` — save server defaults (Manage Server required)",
+          "`/event quick` — create an event using separate date and time fields",
+          "`/event create` — advanced event with custom start/time zone",
+          "`/event list`, `/event edit`, `/event end` — manage one-time events",
+          "`/event recurring create`, `/event recurring list`, `/event recurring disable` — weekly events",
+          "**Time formats:** date `YYYY-MM-DD`, time `HH:mm` (24-hour). Use `UTC` for game/reset time.",
+          "Each alliance has separate events and settings. Only members with Manage Server can make changes."
+        ].join("\n"),
+        ephemeral: true
+      });
+    }
+
+    if (sub === "setup") {
+      const zone = interaction.options.getString("time_zone");
+      const channel = interaction.options.getChannel("channel");
+      if (zone !== null || channel !== null) {
+        if (requireManageGuild(interaction)) return;
+        if (zone !== null) validZone(zone);
+        if (channel && !(await fetchTextChannel(guildId, channel.id))) {
+          throw new Error("Please choose an accessible text channel in this server.");
+        }
+        const previous = await getGuildSettings(guildId);
+        await pool.query(
+          `INSERT INTO guild_settings (guild_id, time_zone, default_channel_id, updated_ts)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (guild_id) DO UPDATE SET
+             time_zone=EXCLUDED.time_zone,
+             default_channel_id=EXCLUDED.default_channel_id,
+             updated_ts=EXCLUDED.updated_ts`,
+          [guildId, zone === null ? previous.time_zone : validZone(zone), channel?.id || previous.default_channel_id, nowMs()]
+        );
+      }
+      const current = await getGuildSettings(guildId);
+      return interaction.reply({
+        content: [
+          "**713 Event Reminders — This Server**",
+          `Time zone: **${current.time_zone}**`,
+          `Default reminder channel: ${current.default_channel_id ? `<#${current.default_channel_id}>` : "Current channel (until configured)"}`,
+          "To update, run `/event setup` with `time_zone` and/or `channel` (Manage Server required).",
+          "This changes defaults for NEW events only; existing event times and channels stay unchanged."
+        ].join("\n"),
+        ephemeral: true
+      });
+    }
+
+    if (sub === "quick") {
+      if (requireManageGuild(interaction)) return;
+      const name = interaction.options.getString("name", true);
+      const date = interaction.options.getString("date", true);
+      const time = interaction.options.getString("time", true);
+      parseHhMm(time);
+      const { tz, channelId } = await chooseGuildDefaults(guildId, interaction);
+      const startTs = parseStartToUtcMillis({ startRaw: `${date} ${time}`, timeZone: tz });
+      if (startTs <= nowMs()) throw new Error("Event must start in the future.");
+      const notes = interaction.options.getString("notes");
+      const mention = "none"; // Safe default; explicit mentions remain in advanced create.
+      const eventId = await createOneTimeEvent({
+        guildId, channelId, name, startTs, notes, mention, createdBy: interaction.user.id
+      });
+      const ch = await fetchTextChannel(guildId, channelId);
+      const embed = new EmbedBuilder()
+        .setTitle(`✅ Event Created: ${name}`)
+        .setDescription([`**Starts:** ${fmtStartBoth(startTs)}`, `**Event ID:** ${eventId}`,
+          notes ? `**Notes:** ${safeTruncate(notes)}` : ""].filter(Boolean).join("\n"));
+      if (ch) await ch.send({ embeds: [embed], allowedMentions: { parse: [] } });
+      return interaction.reply({
+        content: `✅ Event **#${eventId}** scheduled (${tz}). Reminders will post in <#${channelId}>.`,
+        ephemeral: true
+      });
+    }
+
     // ===== RECURRING GROUP =====
     if (group === "recurring") {
 
@@ -445,9 +550,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const repeat_days = interaction.options.getString("repeat_days", true);
         const weeks_ahead = interaction.options.getInteger("weeks_ahead", true);
 
-        const tz = interaction.options.getString("time_zone") || "UTC";
-        const channel = interaction.options.getChannel("channel");
-        const channelId = channel?.id || interaction.channelId;
+        const { tz, channelId } = await chooseGuildDefaults(guildId, interaction);
 
         const notes = interaction.options.getString("notes");
         const mention = normalizeMention(interaction.options.getString("mention") || process.env.DEFAULT_MENTION || "none");
@@ -604,9 +707,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (requireManageGuild(interaction)) return;
       const name = interaction.options.getString("name", true);
       const startRaw = interaction.options.getString("start", true);
-      const tz = interaction.options.getString("time_zone") || "UTC";
-      const channel = interaction.options.getChannel("channel");
-      const channelId = channel?.id || interaction.channelId;
+      const { tz, channelId } = await chooseGuildDefaults(guildId, interaction);
       const notes = interaction.options.getString("notes");
       const mention = normalizeMention(interaction.options.getString("mention") || process.env.DEFAULT_MENTION || "none");
 
@@ -628,9 +729,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [
             `**Starts:** ${fmtStartBoth(startTs)}`,
             `**Event ID:** ${eventId}`,
-            notes ? `\n**Notes:** ${safeTruncate(notes)}` : "",
-            mention !== "none" ? `\n**Reminder mention:** ${mention === "everyone" ? "@everyone" : "@here"}` : ""
-          ].join("")
+            notes ? `**Notes:** ${safeTruncate(notes)}` : "",
+            mention !== "none" ? `**Reminder mention:** ${mention === "everyone" ? "@everyone" : "@here"}` : ""
+          ].filter(Boolean).join("\n")
         );
 
       const ch = await fetchTextChannel(guildId, channelId);
@@ -665,7 +766,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const name = interaction.options.getString("name");
       const startRaw = interaction.options.getString("start");
-      const tz = interaction.options.getString("time_zone") || "UTC";
+      const tz = validZone(interaction.options.getString("time_zone") || (await getGuildSettings(guildId)).time_zone);
       const channel = interaction.options.getChannel("channel");
       const notes = interaction.options.getString("notes");
       const mention = interaction.options.getString("mention");
