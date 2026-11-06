@@ -5,6 +5,9 @@ const {
   GatewayIntentBits,
   Events,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   PermissionsBitField
 } = require("discord.js");
 
@@ -441,9 +444,121 @@ async function remindersTick() {
   }
 }
 
+// ADMIN_DASHBOARD_V1 — read-only, guild-scoped dashboard. No destructive buttons.
+const DASH_PREFIX = "713dash:";
+const DASH_VIEWS = ["overview", "upcoming", "reminders", "recurring"];
+
+function dashboardButtons(active) {
+  const labels = {
+    overview: "Overview", upcoming: "Upcoming", reminders: "Reminders", recurring: "Recurring"
+  };
+  return [new ActionRowBuilder().addComponents(
+    DASH_VIEWS.map((view) => new ButtonBuilder()
+      .setCustomId(`${DASH_PREFIX}${view}`)
+      .setLabel(labels[view])
+      .setStyle(active === view ? ButtonStyle.Primary : ButtonStyle.Secondary))
+  )];
+}
+
+function dashboardEventLine(event) {
+  const timestamp = Math.floor(Number(event.start_ts) / 1000);
+  // A Discord timestamp automatically renders in the reader's locale.
+  return `#${event.id} • ${safeTruncate(event.name, 85)} • <t:${timestamp}:f> • <#${event.channel_id}>`;
+}
+
+async function dashboardContent(guildId, guildName, view) {
+  if (!DASH_VIEWS.includes(view)) throw new Error("Unknown dashboard view.");
+  const cfg = await getGuildSettings(guildId);
+  const safeName = safeTruncate((guildName || "Alliance").replace(/@/g, "＠"), 90);
+  const embed = new EmbedBuilder()
+    .setTitle(`🛡️ 713 Alliance Admin • ${view.charAt(0).toUpperCase() + view.slice(1)}`)
+    .setColor(0x2a9dbe)
+    .setDescription(`**Server:** ${safeName}\n**Time zone:** ${cfg.time_zone}\n**Default channel:** ${cfg.default_channel_id ? `<#${cfg.default_channel_id}>` : "Current channel"}`)
+    .setFooter({ text: "Private administrator view • Data is limited to this Discord server" });
+
+  if (view === "overview") {
+    const result = await pool.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM events WHERE guild_id=$1 AND is_active=TRUE AND start_ts >= $2) AS future_events,
+        (SELECT COUNT(*)::int FROM recurring_templates WHERE guild_id=$1 AND is_enabled=TRUE) AS enabled_templates,
+        (SELECT COUNT(*)::int FROM event_reminders er JOIN events e ON e.id=er.event_id
+          WHERE e.guild_id=$1 AND e.is_active=TRUE AND er.fired=FALSE AND e.start_ts >= $2) AS pending_reminders,
+        (SELECT COUNT(*)::int FROM event_reminders er JOIN events e ON e.id=er.event_id
+          WHERE e.guild_id=$1 AND e.is_active=TRUE AND er.fired=FALSE AND er.remind_at_ts <= $2) AS due_reminders`,
+      [guildId, nowMs()]
+    );
+    const row = result.rows[0];
+    embed.addFields(
+      { name: "Upcoming active events", value: String(row.future_events), inline: true },
+      { name: "Enabled recurring templates", value: String(row.enabled_templates), inline: true },
+      { name: "Pending reminders", value: String(row.pending_reminders), inline: true },
+      { name: "Reminders due/overdue", value: String(row.due_reminders), inline: true },
+      { name: "Manage", value: "`/event quick` • `/event setup` • `/event list`\n`/event edit` and `/event end` require an explicit event ID." }
+    );
+  } else if (view === "upcoming") {
+    const result = await pool.query(`
+      SELECT id, name, start_ts, channel_id FROM events
+      WHERE guild_id=$1 AND is_active=TRUE AND start_ts >= $2
+      ORDER BY start_ts ASC LIMIT 8`, [guildId, nowMs()]);
+    embed.addFields({ name: "Next eight scheduled events", value: result.rows.length
+      ? result.rows.map(dashboardEventLine).join("\n").slice(0, 1000)
+      : "No upcoming active events." },
+    { name: "Actions", value: "Use `/event quick` to schedule; `/event edit` or `/event end` with a verified event ID to modify." });
+  } else if (view === "reminders") {
+    const counts = await pool.query(`
+      SELECT COUNT(*) FILTER (WHERE er.fired=FALSE)::int AS pending,
+             COUNT(*) FILTER (WHERE er.fired=TRUE)::int AS fired,
+             COUNT(*) FILTER (WHERE er.fired=FALSE AND er.remind_at_ts <= $2)::int AS due
+      FROM event_reminders er
+      JOIN events e ON e.id=er.event_id
+      WHERE e.guild_id=$1 AND e.is_active=TRUE AND e.start_ts >= $2`, [guildId, nowMs()]);
+    const due = await pool.query(`
+      SELECT er.event_id, e.name, er.remind_at_ts, e.channel_id
+      FROM event_reminders er JOIN events e ON e.id=er.event_id
+      WHERE e.guild_id=$1 AND e.is_active=TRUE AND er.fired=FALSE
+      ORDER BY er.remind_at_ts ASC LIMIT 6`, [guildId]);
+    const c = counts.rows[0];
+    embed.addFields(
+      { name: "Future-event reminder counts", value: `Pending: **${c.pending}** • Fired: **${c.fired}** • Due/overdue: **${c.due}**` },
+      { name: "Next pending reminders", value: due.rows.length
+        ? due.rows.map(r => `Event #${r.event_id} • ${safeTruncate(r.name, 65)} • <t:${Math.floor(Number(r.remind_at_ts)/1000)}:R> • <#${r.channel_id}>`).join("\n").slice(0, 1000)
+        : "No pending reminders." },
+      { name: "Note", value: "Counts reflect database records, not a guarantee of message delivery. A due reminder may be waiting for a channel to become accessible." }
+    );
+  } else {
+    const result = await pool.query(`
+      SELECT id, name, is_enabled, time_hhmm, tz, channel_id
+      FROM recurring_templates WHERE guild_id=$1 ORDER BY id DESC LIMIT 8`, [guildId]);
+    embed.addFields(
+      { name: "Recent recurring templates", value: result.rows.length
+        ? result.rows.map(t => `#${t.id} • ${safeTruncate(t.name, 70)} • ${t.is_enabled ? "Enabled" : "Disabled"} • ${t.time_hhmm} ${t.tz}`).join("\n").slice(0, 1000)
+        : "No recurring templates." },
+      { name: "Safe management", value: "Use `/event recurring list` to confirm a template ID, then `/event recurring disable` or `/event recurring edit`. This dashboard does not delete anything." }
+    );
+  }
+  return { embeds: [embed], components: dashboardButtons(view), allowedMentions: { parse: [] } };
+}
+
 // -------------------- INTERACTIONS --------------------
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  // ADMIN_DASHBOARD_V1 buttons: private, read-only, no cross-guild access.
+  if (interaction.isButton() && interaction.customId.startsWith(DASH_PREFIX)) {
+    try {
+      if (!interaction.guildId || !interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: "Manage Server permission is required.", ephemeral: true });
+      }
+      const view = interaction.customId.slice(DASH_PREFIX.length);
+      if (!DASH_VIEWS.includes(view)) return interaction.reply({ content: "Unknown dashboard view.", ephemeral: true });
+      await interaction.deferUpdate();
+      return interaction.editReply(await dashboardContent(interaction.guildId, interaction.guild?.name, view));
+    } catch (err) {
+      console.error("Dashboard button error:", err);
+      const response = { content: "Dashboard could not refresh. Try /event dashboard.", components: [] };
+      if (interaction.deferred || interaction.replied) return interaction.editReply(response).catch(() => {});
+      return interaction.reply({ content: response.content, ephemeral: true }).catch(() => {});
+    }
+  }
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "event") return;
 
@@ -459,6 +574,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const selectedChannel = interaction.options.getChannel("channel");
     if (selectedChannel && selectedChannel.guildId !== guildId) {
       return interaction.reply({ content: "Channel must belong to this server.", ephemeral: true });
+    }
+
+    // ADMIN_DASHBOARD_V1 requires Manage Server; controls only display data.
+    if (sub === "dashboard") {
+      if (requireManageGuild(interaction)) return;
+      await interaction.deferReply({ ephemeral: true });
+      return interaction.editReply(await dashboardContent(guildId, interaction.guild?.name, "overview"));
     }
 
     // Setup and help are read-only unless explicitly updating this guild's settings.

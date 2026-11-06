@@ -24,6 +24,12 @@ const commands = [
     .setName("event")
     .setDescription("Create/manage events (UTC game time + reminders + recurring)")
 
+    // ADMIN_DASHBOARD_V1: ephemeral administrator overview and read-only buttons.
+    .addSubcommand(sc =>
+      sc.setName("dashboard")
+        .setDescription("Private alliance admin overview, events and reminder status")
+    )
+
     .addSubcommand(sc =>
       sc.setName("help")
         .setDescription("How to configure this alliance and schedule events")
