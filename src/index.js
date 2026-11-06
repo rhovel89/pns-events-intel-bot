@@ -15,6 +15,7 @@ const { DateTime } = require("luxon");
 const { randomUUID } = require("node:crypto");
 const { makePool, initDb } = require("./db");
 const { createCalendar } = require("./calendar");
+const { anchorDay, recurrenceMatches } = require("./recurrence");
 
 const {
   parseReminders,
@@ -104,14 +105,14 @@ const calendar = createCalendar({ pool, getGuildSettings });
 
 // -------------------- EVENTS --------------------
 
-async function createEventReminders(eventId, startTs, remindersArr) {
+async function createEventReminders(eventId, startTs, remindersArr, db = pool) {
   const rems = (remindersArr || []).map(m => ({
     remind_at_ts: startTs - m * 60 * 1000
   }));
 
   for (const r of rems) {
     if (r.remind_at_ts <= nowMs()) continue;
-    await pool.query(
+    await db.query(
       `INSERT INTO event_reminders (event_id, remind_at_ts, fired)
        VALUES ($1, $2, FALSE)`,
       [eventId, r.remind_at_ts]
@@ -127,13 +128,15 @@ async function createOneTimeEvent({
   notes,
   mention,
   createdBy,
-  recurringTemplateId = null
+  recurringTemplateId = null,
+  db = pool
 }) {
   const createdTs = nowMs();
 
-  const res = await pool.query(
+  const res = await db.query(
     `INSERT INTO events (guild_id, channel_id, name, start_ts, notes, is_active, created_by, created_ts, mention, recurring_template_id)
      VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9)
+     ON CONFLICT (recurring_template_id, start_ts) WHERE recurring_template_id IS NOT NULL DO NOTHING
      RETURNING id`,
     [
       guildId,
@@ -148,11 +151,10 @@ async function createOneTimeEvent({
     ]
   );
 
+  if (!res.rowCount) return null; // Already generated occurrence; do not duplicate reminders.
   const eventId = res.rows[0].id;
-
   const reminders = parseReminders();
-  await createEventReminders(eventId, startTs, reminders);
-
+  await createEventReminders(eventId, startTs, reminders, db);
   return eventId;
 }
 
@@ -241,14 +243,16 @@ async function createRecurringTemplate({
   remindersStr,
   weeksAhead,
   mention,
-  createdBy
+  createdBy,
+  intervalWeeks = 1,
+  anchorDate
 }) {
   const createdTs = nowMs();
 
   const res = await pool.query(
     `INSERT INTO recurring_templates
-     (guild_id, channel_id, name, tz, time_hhmm, repeat_days, notes, reminders, weeks_ahead, is_enabled, mention, created_by, created_ts)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11,$12)
+     (guild_id, channel_id, name, tz, time_hhmm, repeat_days, notes, reminders, weeks_ahead, is_enabled, mention, created_by, created_ts, interval_weeks, anchor_date)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11,$12,$13,$14::date)
      RETURNING id`,
     [
       guildId,
@@ -262,7 +266,9 @@ async function createRecurringTemplate({
       weeksAhead,
       mention ?? "none",
       createdBy ?? null,
-      createdTs
+      createdTs,
+      intervalWeeks,
+      anchorDate
     ]
   );
 
@@ -271,7 +277,8 @@ async function createRecurringTemplate({
 
 async function listRecurringTemplates(guildId) {
   const res = await pool.query(
-    `SELECT id, name, channel_id, tz, time_hhmm, repeat_days, weeks_ahead, is_enabled, mention
+    `SELECT id, name, channel_id, tz, time_hhmm, repeat_days, weeks_ahead, is_enabled, mention,
+       interval_weeks, anchor_date::text AS anchor_date
      FROM recurring_templates
      WHERE guild_id=$1
      ORDER BY id DESC
@@ -292,12 +299,12 @@ async function setTemplateEnabled(guildId, templateId, enabled) {
   return res.rowCount ? res.rows[0] : null;
 }
 
-async function editRecurringTemplate(guildId, templateId, patch) {
+async function editRecurringTemplate(guildId, templateId, patch, db = pool) {
   const fields = [];
   const values = [];
   let i = 1;
 
-  const allowed = ["name", "tz", "time_hhmm", "repeat_days", "weeks_ahead", "notes", "mention", "channel_id"];
+  const allowed = ["name", "tz", "time_hhmm", "repeat_days", "weeks_ahead", "notes", "mention", "channel_id", "interval_weeks", "anchor_date"];
   for (const k of allowed) {
     if (patch[k] === undefined) continue;
     fields.push(`${k}=$${i++}`);
@@ -307,7 +314,7 @@ async function editRecurringTemplate(guildId, templateId, patch) {
 
   values.push(nowMs(), guildId, templateId);
 
-  const res = await pool.query(
+  const res = await db.query(
     `UPDATE recurring_templates
      SET ${fields.join(", ")}, updated_ts=$${i}
      WHERE guild_id=$${i + 1} AND id=$${i + 2}
@@ -331,38 +338,33 @@ function parseYyyyMmDd(dateStr) {
   return dt.startOf("day");
 }
 
-async function generateTemplateEvents(template, anchorDateStr) {
-  const tz = template.tz || "UTC";
+async function generateTemplateEvents(template, anchorDateStr, db = pool) {
+  const tz = validZone(template.tz || "UTC");
   const { hh, mm } = parseHhMm(template.time_hhmm);
   const repeatDays = template.repeat_days || [];
-  const weeksAhead = template.weeks_ahead || 4;
-
-  const anchor = parseYyyyMmDd(anchorDateStr || DateTime.utc().toFormat("yyyy-LL-dd"));
-
+  const weeksAhead = Math.min(52, Math.max(1, Number(template.weeks_ahead) || 4));
+  const intervalWeeks = Number(template.interval_weeks ?? 1);
+  // Persisted anchor is essential: a scheduler restart must not flip the alternating weeks.
+  const storedAnchor = Object.prototype.toString.call(template.anchor_date) === "[object Date]"
+    ? DateTime.fromJSDate(template.anchor_date, { zone: "UTC" }).toFormat("yyyy-LL-dd")
+    : template.anchor_date ? String(template.anchor_date).slice(0, 10) : null;
+  const anchor = anchorDay(storedAnchor || anchorDateStr ||
+    DateTime.now().setZone(tz).toFormat("yyyy-LL-dd"), tz);
+  const todayLocal = DateTime.now().setZone(tz).startOf("day");
+  const requestedFrom = anchorDateStr ? anchorDay(anchorDateStr, tz) : todayLocal;
+  const from = requestedFrom > todayLocal ? requestedFrom : todayLocal;
   const startRangeUtc = DateTime.utc();
-  const endRangeUtc = DateTime.utc().plus({ days: weeksAhead * 7 });
-
+  const endRangeUtc = startRangeUtc.plus({ days: weeksAhead * 7 });
   let inserted = 0;
-
-  for (let d = anchor; d <= endRangeUtc; d = d.plus({ days: 1 })) {
-    const weekday = d.weekday; // 1..7
-    const isWanted = repeatDays.some(x => dayToLuxonWeekday(x) === weekday);
-    if (!isWanted) continue;
-
-    const local = DateTime.fromObject(
-      { year: d.year, month: d.month, day: d.day, hour: hh, minute: mm, second: 0, millisecond: 0 },
-      { zone: tz }
-    );
-    if (!local.isValid) continue;
-
-    const startUtc = local.toUTC();
-    const startTs = startUtc.toMillis();
-
-    if (startTs < startRangeUtc.toMillis()) continue;
-    if (startTs > endRangeUtc.toMillis()) continue;
+  for (let d = from; d.toMillis() <= endRangeUtc.plus({days: 2}).toMillis(); d = d.plus({ days: 1 })) {
+    if (!recurrenceMatches(d, anchor, repeatDays, intervalWeeks)) continue;
+    const local = d.set({ hour: hh, minute: mm, second: 0, millisecond: 0 });
+    if (!local.isValid || local.hour !== hh || local.minute !== mm) continue;
+    const startTs = local.toUTC().toMillis();
+    if (startTs < startRangeUtc.toMillis() || startTs > endRangeUtc.toMillis()) continue;
 
     try {
-      await createOneTimeEvent({
+      const eventId = await createOneTimeEvent({
         guildId: template.guild_id,
         channelId: template.channel_id,
         name: template.name,
@@ -370,21 +372,23 @@ async function generateTemplateEvents(template, anchorDateStr) {
         notes: template.notes,
         mention: template.mention || "none",
         createdBy: template.created_by,
-        recurringTemplateId: template.id
+        recurringTemplateId: template.id,
+        db
       });
-      inserted += 1;
-    } catch {
-      // Duplicate insert ignored (unique index in db.js)
+      if (eventId !== null) inserted += 1;
+    } catch (err) {
+      // Never conceal database failures during regeneration.
+      throw err;
     }
   }
 
   return inserted;
 }
 
-async function purgeTemplateEvents(guildId, templateId, fromTs, all) {
+async function purgeTemplateEvents(guildId, templateId, fromTs, all, db = pool) {
   const from = all ? 0 : fromTs;
 
-  const idsRes = await pool.query(
+  const idsRes = await db.query(
     `SELECT id FROM events
      WHERE guild_id=$1 AND recurring_template_id=$2 AND start_ts >= $3`,
     [guildId, templateId, from]
@@ -393,9 +397,9 @@ async function purgeTemplateEvents(guildId, templateId, fromTs, all) {
   const eventIds = idsRes.rows.map(r => r.id);
   if (!eventIds.length) return { deletedEvents: 0 };
 
-  await pool.query(`DELETE FROM event_reminders WHERE event_id = ANY($1::int[])`, [eventIds]);
-  await pool.query(`DELETE FROM rsvps WHERE event_id = ANY($1::int[])`, [eventIds]);
-  const delRes = await pool.query(`DELETE FROM events WHERE id = ANY($1::int[])`, [eventIds]);
+  await db.query(`DELETE FROM event_reminders WHERE event_id = ANY($1::int[])`, [eventIds]);
+  await db.query(`DELETE FROM rsvps WHERE event_id = ANY($1::int[])`, [eventIds]);
+  const delRes = await db.query(`DELETE FROM events WHERE guild_id=$2 AND id = ANY($1::int[])`, [eventIds, guildId]);
 
   return { deletedEvents: delRes.rowCount || 0 };
 }
@@ -411,9 +415,21 @@ async function deleteTemplate(guildId, templateId) {
 // Background generator tick
 async function recurringTick() {
   try {
-    const res = await pool.query(`SELECT * FROM recurring_templates WHERE is_enabled=TRUE`);
+    const res = await pool.query(`SELECT id FROM recurring_templates WHERE is_enabled=TRUE`);
     for (const t of res.rows) {
-      await generateTemplateEvents(t, DateTime.utc().toFormat("yyyy-LL-dd"));
+      const db = await pool.connect();
+      try {
+        await db.query("BEGIN");
+        const locked = await db.query(
+          `SELECT * FROM recurring_templates WHERE id=$1 AND is_enabled=TRUE FOR UPDATE`, [t.id]);
+        if (locked.rowCount) await generateTemplateEvents(locked.rows[0], undefined, db);
+        await db.query("COMMIT");
+      } catch (err) {
+        await db.query("ROLLBACK").catch(() => {});
+        console.error(`Recurring template #${t.id} generation error:`, err);
+      } finally {
+        db.release();
+      }
     }
   } catch (e) {
     console.error("Recurring tick error:", e);
@@ -779,6 +795,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const time = interaction.options.getString("time", true);
         const repeat_days = interaction.options.getString("repeat_days", true);
         const weeks_ahead = interaction.options.getInteger("weeks_ahead", true);
+        const intervalWeeks = interaction.options.getInteger("interval_weeks") || 1;
+        if (![1, 2].includes(intervalWeeks)) throw new Error("Choose Every week or Every other week.");
 
         const { tz, channelId } = await chooseGuildDefaults(guildId, interaction);
 
@@ -787,6 +805,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const repeatDaysArr = normalizeRepeatDays(repeat_days);
 
         parseHhMm(time); // validate time
+        const validatedAnchor = anchorDay(date, tz).toFormat("yyyy-LL-dd");
+        if (weeks_ahead < 1 || weeks_ahead > 52) throw new Error("weeks_ahead must be 1–52.");
 
         const templateId = await createRecurringTemplate({
           guildId,
@@ -799,14 +819,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           remindersStr: process.env.EVENT_REMINDERS || "60,15,5",
           weeksAhead: weeks_ahead,
           mention,
-          createdBy: interaction.user.id
+          createdBy: interaction.user.id,
+          intervalWeeks,
+          anchorDate: validatedAnchor
         });
 
         const tRes = await pool.query(`SELECT * FROM recurring_templates WHERE id=$1`, [templateId]);
         const inserted = await generateTemplateEvents(tRes.rows[0], date);
 
         return interaction.reply({
-          content: `✅ Created recurring template **#${templateId}** and generated **${inserted}** event(s). Reminders will post in <#${channelId}>.`,
+          content: `✅ Created **${intervalWeeks === 2 ? "every-other-week" : "weekly"}** template **#${templateId}** on **${repeatDaysArr.join(", ")}**, anchored **${validatedAnchor}** (${tz}); generated **${inserted}** event(s). Reminders will post in <#${channelId}>.`,
           ephemeral: true
         });
       }
@@ -814,7 +836,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sub === "list") {
         await interaction.deferReply({ ephemeral: true });
         const rows = await listRecurringTemplates(guildId);
-        const lines = rows.map(r => `#${r.id} • ${r.name} • ${r.time_hhmm} (${r.tz}) • ${r.is_enabled ? "enabled" : "disabled"}`);
+        const lines = rows.map(r => `#${r.id} • ${r.name} • ${r.time_hhmm} (${r.tz}) • ${Number(r.interval_weeks) === 2 ? "every other week" : "weekly"} [${r.repeat_days.join(",")}]${r.anchor_date ? ` • anchor ${r.anchor_date}` : ""} • ${r.is_enabled ? "enabled" : "disabled"}`);
         return interaction.editReply({ content: lines.length ? lines.join("\n").slice(0, 1900) : "No recurring templates." });
       }
 
@@ -841,6 +863,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const zone = interaction.options.getString("time_zone");
         const days = interaction.options.getString("repeat_days");
         const weeks = interaction.options.getInteger("weeks_ahead");
+        const intervalWeeks = interaction.options.getInteger("interval_weeks");
+        const newAnchor = interaction.options.getString("anchor_date");
         const channel = interaction.options.getChannel("channel");
         const notes = interaction.options.getString("notes");
         const mention = interaction.options.getString("mention");
@@ -851,19 +875,68 @@ client.on(Events.InteractionCreate, async (interaction) => {
           patch.tz = zone;
         }
         if (days !== null) patch.repeat_days = normalizeRepeatDays(days);
-        if (weeks !== null) patch.weeks_ahead = weeks;
+        if (weeks !== null) {
+          if (weeks < 1 || weeks > 52) throw new Error("weeks_ahead must be 1–52.");
+          patch.weeks_ahead = weeks;
+        }
+        if (intervalWeeks !== null) {
+          if (![1, 2].includes(intervalWeeks)) throw new Error("Invalid repeat interval.");
+          if (intervalWeeks === 2 && newAnchor === null) {
+            const current = await pool.query(
+              `SELECT anchor_date FROM recurring_templates WHERE guild_id=$1 AND id=$2`,
+              [guildId, templateId]);
+            if (!current.rowCount) throw new Error("Template not found.");
+            if (!current.rows[0].anchor_date) throw new Error("Set anchor_date when changing an older weekly template to every other week.");
+          }
+          patch.interval_weeks = intervalWeeks;
+        }
+        if (newAnchor !== null) {
+          const existing = await pool.query(`SELECT tz FROM recurring_templates WHERE guild_id=$1 AND id=$2`, [guildId, templateId]);
+          if (!existing.rowCount) throw new Error("Template not found.");
+          patch.anchor_date = anchorDay(newAnchor, patch.tz || existing.rows[0].tz).toFormat("yyyy-LL-dd");
+        }
         if (channel) patch.channel_id = channel.id;
         if (notes !== null) patch.notes = notes;
         if (mention !== null) patch.mention = normalizeMention(mention);
-        if (interaction.options.getBoolean("apply_future") && interaction.options.getString("confirm") !== `APPLY ${templateId}`) {
+        const applyFuture = interaction.options.getBoolean("apply_future") === true;
+        if ((patch.interval_weeks !== undefined || patch.anchor_date !== undefined) && !applyFuture)
+          throw new Error(`Changing the frequency or anchor requires apply_future:true with confirm:APPLY ${templateId} so generated occurrences stay consistent.`);
+        if (applyFuture && interaction.options.getString("confirm") !== `APPLY ${templateId}`) {
           throw new Error(`Nothing changed. Set confirm to APPLY ${templateId} before regenerating future events.`);
+        }
+        if (!Object.keys(patch).length) {
+          return interaction.reply({ content: "No changes supplied.", ephemeral: true });
+        }
+        if (applyFuture) {
+          // All edits, deletions, new events, and reminders are one atomic transaction.
+          const db = await pool.connect();
+          try {
+            await db.query("BEGIN");
+            const locked = await db.query(
+              `SELECT id FROM recurring_templates WHERE guild_id=$1 AND id=$2 FOR UPDATE`,
+              [guildId, templateId]);
+            if (!locked.rowCount) {
+              await db.query("ROLLBACK");
+              return interaction.reply({ content: "Template not found.", ephemeral: true });
+            }
+            const result = await editRecurringTemplate(guildId, templateId, patch, db);
+            if (!result.updated) throw new Error("Template could not be updated.");
+            const purged = await purgeTemplateEvents(guildId, templateId, nowMs(), false, db);
+            const inserted = result.row.is_enabled
+              ? await generateTemplateEvents(result.row, undefined, db) : 0;
+            await db.query("COMMIT");
+            return interaction.reply({ content:
+              `✅ Updated recurring template #${templateId}. Regenerated ${inserted} future event(s); replaced ${purged.deletedEvents}.`,
+              ephemeral: true });
+          } catch (err) {
+            await db.query("ROLLBACK").catch(() => {});
+            throw err;
+          } finally {
+            db.release();
+          }
         }
         const result = await editRecurringTemplate(guildId, templateId, patch);
         if (!result.updated) return interaction.reply({ content: "Template not found or no changes.", ephemeral: true });
-        if (interaction.options.getBoolean("apply_future")) {
-          await purgeTemplateEvents(guildId, templateId, nowMs(), false);
-          if (result.row.is_enabled) await generateTemplateEvents(result.row, DateTime.utc().toFormat("yyyy-LL-dd"));
-        }
         return interaction.reply({ content: `Updated recurring template #${templateId}.`, ephemeral: true });
       }
 

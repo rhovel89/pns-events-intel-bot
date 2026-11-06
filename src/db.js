@@ -71,6 +71,8 @@ async function initDb(pool) {
       tz TEXT NOT NULL DEFAULT 'UTC',
       time_hhmm TEXT NOT NULL,
       repeat_days TEXT[] NOT NULL,
+      interval_weeks INT NOT NULL DEFAULT 1,
+      anchor_date DATE,
       notes TEXT,
       reminders TEXT,
       weeks_ahead INT NOT NULL DEFAULT 4,
@@ -98,6 +100,9 @@ async function initDb(pool) {
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS mention TEXT DEFAULT 'none';`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS recurring_template_id INT;`);
   await pool.query(`ALTER TABLE recurring_templates ADD COLUMN IF NOT EXISTS mention TEXT DEFAULT 'none';`);
+  // BIWEEKLY_V1: safe additive migration. Legacy templates remain weekly.
+  await pool.query(`ALTER TABLE recurring_templates ADD COLUMN IF NOT EXISTS interval_weeks INT NOT NULL DEFAULT 1;`);
+  await pool.query(`ALTER TABLE recurring_templates ADD COLUMN IF NOT EXISTS anchor_date DATE;`);
 
   // DELIVERY_V2: idempotent delivery claims, retries and traceability.
   // Null claim_until / next_attempt_ts mean immediately eligible when due.

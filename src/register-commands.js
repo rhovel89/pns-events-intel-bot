@@ -114,8 +114,10 @@ const commands = [
             .addStringOption(o => o.setName("date").setDescription("Anchor date YYYY-MM-DD").setRequired(true))
             .addStringOption(o => o.setName("time").setDescription("Start time HH:MM (24h)").setRequired(true))
             .addStringOption(o => o.setName("repeat_days").setDescription("Comma days: mon,tue,wed,thu,fri,sat,sun").setRequired(true))
-            .addIntegerOption(o => o.setName("weeks_ahead").setDescription("How many weeks to generate (e.g., 4, 8)").setRequired(true))
+            .addIntegerOption(o => o.setName("weeks_ahead").setDescription("How many weeks to generate (1–52)").setRequired(true).setMinValue(1).setMaxValue(52))
             // Optional after
+            .addIntegerOption(o => o.setName("interval_weeks").setDescription("Repeat interval").addChoices(
+              { name: "Every week", value: 1 }, { name: "Every other week", value: 2 }))
             .addStringOption(o => o.setName("time_zone").setDescription("IANA zone (default UTC)").setRequired(false))
             .addChannelOption(o => o.setName("channel").setDescription("Where to post reminders (default: current channel)").addChannelTypes(ChannelType.GuildText).setRequired(false))
             .addStringOption(o => o.setName("notes").setDescription("Optional series notes").setRequired(false))
@@ -135,7 +137,10 @@ const commands = [
             .addStringOption(o => o.setName("time").setDescription("HH:MM (24h)").setRequired(false))
             .addStringOption(o => o.setName("time_zone").setDescription("IANA zone (default UTC)").setRequired(false))
             .addStringOption(o => o.setName("repeat_days").setDescription("Comma days: mon,wed,sun").setRequired(false))
-            .addIntegerOption(o => o.setName("weeks_ahead").setDescription("Weeks ahead policy").setRequired(false))
+            .addIntegerOption(o => o.setName("weeks_ahead").setDescription("Weeks ahead policy").setRequired(false).setMinValue(1).setMaxValue(52))
+            .addIntegerOption(o => o.setName("interval_weeks").setDescription("Every week or every other week").addChoices(
+              { name: "Every week", value: 1 }, { name: "Every other week", value: 2 }))
+            .addStringOption(o => o.setName("anchor_date").setDescription("YYYY-MM-DD: defines active alternating weeks"))
             .addChannelOption(o => o.setName("channel").setDescription("New channel").addChannelTypes(ChannelType.GuildText).setRequired(false))
             .addStringOption(o => o.setName("notes").setDescription("Replace notes").setRequired(false))
             .addStringOption(o => o.setName("mention").setDescription("Change mention").setRequired(false).addChoices(...mentionChoices))
