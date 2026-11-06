@@ -127,6 +127,7 @@ const commands = [
             .addStringOption(o => o.setName("notes").setDescription("Replace notes").setRequired(false))
             .addStringOption(o => o.setName("mention").setDescription("Change mention").setRequired(false).addChoices(...mentionChoices))
             .addBooleanOption(o => o.setName("apply_future").setDescription("If true, purge future and regenerate with new settings").setRequired(false))
+            .addStringOption(o => o.setName("confirm").setDescription("For apply_future: type APPLY <template_id>").setRequired(false))
         )
 
         .addSubcommand(sc =>
@@ -155,6 +156,7 @@ const commands = [
                 )
             )
             .addStringOption(o => o.setName("from").setDescription("For scope=future: YYYY-MM-DD (default now)").setRequired(false))
+            .addStringOption(o => o.setName("confirm").setDescription("Required: type DELETE <template_id>").setRequired(false))
         )
 
         // BULK purge occurrences/events only, keep template
@@ -170,6 +172,7 @@ const commands = [
                 )
             )
             .addStringOption(o => o.setName("from").setDescription("For range=future: YYYY-MM-DD (default now)").setRequired(false))
+            .addStringOption(o => o.setName("confirm").setDescription("Required: type PURGE <template_id>").setRequired(false))
         )
     )
 ].map(c => c.toJSON());

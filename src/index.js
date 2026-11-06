@@ -174,32 +174,53 @@ async function endEvent(guildId, eventId) {
   return res.rowCount ? res.rows[0] : null;
 }
 
+// RELIABILITY_V1: atomic per-event edit and pending reminder reschedule.
 async function editEvent(guildId, eventId, patch) {
-  // Dynamic update builder
-  const fields = [];
-  const values = [];
-  let i = 1;
-
   const allowed = ["name", "start_ts", "notes", "mention", "channel_id"];
-  for (const k of allowed) {
-    if (patch[k] === undefined) continue;
-    fields.push(`${k}=$${i++}`);
-    values.push(patch[k]);
+  const fields = allowed.filter(k => patch[k] !== undefined);
+  if (!fields.length) return { updated: false, row: null, rescheduled: false };
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN");
+    const original = await db.query(
+      `SELECT id, start_ts, is_active FROM events WHERE guild_id=$1 AND id=$2 FOR UPDATE`,
+      [guildId, eventId]
+    );
+    if (!original.rowCount || !original.rows[0].is_active) {
+      await db.query("ROLLBACK");
+      return { updated: false, row: null, rescheduled: false };
+    }
+    if (patch.start_ts !== undefined && Number(patch.start_ts) <= nowMs()) {
+      throw new Error("Edited event must start in the future.");
+    }
+    const values = fields.map(k => patch[k]);
+    const assignments = fields.map((k, i) => `${k}=$${i+1}`);
+    values.push(nowMs(), guildId, eventId);
+    const i = fields.length;
+    const res = await db.query(
+      `UPDATE events SET ${assignments.join(", ")}, updated_ts=$${i+1}
+       WHERE guild_id=$${i+2} AND id=$${i+3} AND is_active=TRUE
+       RETURNING id, name, start_ts, notes, mention, channel_id`, values
+    );
+    const rescheduled = patch.start_ts !== undefined &&
+      Number(patch.start_ts) !== Number(original.rows[0].start_ts);
+    if (rescheduled) {
+      await db.query(`DELETE FROM event_reminders WHERE event_id=$1 AND fired=FALSE`, [eventId]);
+      const times = [...new Set(parseReminders().map(minutes =>
+        Number(patch.start_ts) - minutes * 60000).filter(ts => ts > nowMs()))];
+      for (const ts of times) {
+        await db.query(`INSERT INTO event_reminders (event_id, remind_at_ts, fired)
+          VALUES ($1,$2,FALSE)`, [eventId, ts]);
+      }
+    }
+    await db.query("COMMIT");
+    return { updated: res.rowCount > 0, row: res.rows[0] || null, rescheduled };
+  } catch (e) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    db.release();
   }
-  if (!fields.length) return { updated: false, row: null };
-
-  values.push(nowMs(), guildId, eventId);
-
-  const res = await pool.query(
-    `UPDATE events
-     SET ${fields.join(", ")},
-         updated_ts=$${i}
-     WHERE guild_id=$${i + 1} AND id=$${i + 2}
-     RETURNING id, name, start_ts, notes, mention, channel_id`,
-    values
-  );
-
-  return { updated: res.rowCount > 0, row: res.rowCount ? res.rows[0] : null };
 }
 
 // -------------------- RECURRING --------------------
@@ -747,6 +768,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (channel) patch.channel_id = channel.id;
         if (notes !== null) patch.notes = notes;
         if (mention !== null) patch.mention = normalizeMention(mention);
+        if (interaction.options.getBoolean("apply_future") && interaction.options.getString("confirm") !== `APPLY ${templateId}`) {
+          throw new Error(`Nothing changed. Set confirm to APPLY ${templateId} before regenerating future events.`);
+        }
         const result = await editRecurringTemplate(guildId, templateId, patch);
         if (!result.updated) return interaction.reply({ content: "Template not found or no changes.", ephemeral: true });
         if (interaction.options.getBoolean("apply_future")) {
@@ -762,6 +786,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const templateId = interaction.options.getInteger("template_id", true);
         const range = interaction.options.getString("range", true);
         const fromStr = interaction.options.getString("from");
+        if (interaction.options.getString("confirm") !== `PURGE ${templateId}`) {
+          throw new Error(`Nothing deleted. Set confirm to PURGE ${templateId}.`);
+        }
 
         const fromTs = (range === "all")
           ? 0
@@ -781,6 +808,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const templateId = interaction.options.getInteger("template_id", true);
         const scope = interaction.options.getString("scope", true);
         const fromStr = interaction.options.getString("from");
+        if (interaction.options.getString("confirm") !== `DELETE ${templateId}`) {
+          throw new Error(`Nothing deleted. Set confirm to DELETE ${templateId}.`);
+        }
 
         if (scope === "template_only") {
           await setTemplateEnabled(guildId, templateId, false);
@@ -902,7 +932,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const result = await editEvent(guildId, eventId, patch);
       if (!result.updated) return interaction.reply({ content: "Event not found or no changes.", ephemeral: true });
 
-      return interaction.reply({ content: `✅ Updated event **#${eventId}**.`, ephemeral: true });
+      return interaction.reply({ content: `✅ Updated event **#${eventId}**.${result.rescheduled ? " Pending reminders were rescheduled; fired reminders were preserved." : ""}`, ephemeral: true });
     }
 
     return interaction.reply({ content: "Unknown subcommand.", ephemeral: true });

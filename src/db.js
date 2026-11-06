@@ -93,6 +93,8 @@ async function initDb(pool) {
   `);
 
   // Safety upgrades (in case tables existed older)
+  // RELIABILITY_V1: support metadata edits on existing databases.
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_ts BIGINT;`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS mention TEXT DEFAULT 'none';`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS recurring_template_id INT;`);
   await pool.query(`ALTER TABLE recurring_templates ADD COLUMN IF NOT EXISTS mention TEXT DEFAULT 'none';`);
