@@ -4,9 +4,12 @@ const { REST, Routes, SlashCommandBuilder, ChannelType } = require("discord.js")
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;
 const guildId = process.env.GUILD_ID;
+// GUILD preserves existing single-server behavior. GLOBAL enables multi-server commands.
+const commandScope = (process.env.COMMAND_SCOPE || "GUILD").toUpperCase();
+if (!["GUILD", "GLOBAL"].includes(commandScope)) throw new Error("Invalid COMMAND_SCOPE");
 
-if (!token || !clientId || !guildId) {
-  console.error("Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID in environment.");
+if (!token || !clientId || (commandScope === "GUILD" && !guildId)) {
+  console.error("Missing DISCORD_TOKEN, CLIENT_ID or required GUILD_ID.");
   process.exit(1);
 }
 
@@ -149,8 +152,11 @@ const rest = new REST({ version: "10" }).setToken(token);
 (async () => {
   try {
     console.log("Registering slash commands...");
-    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
-    console.log("Slash commands registered successfully.");
+    const route = commandScope === "GLOBAL"
+      ? Routes.applicationCommands(clientId)
+      : Routes.applicationGuildCommands(clientId, guildId);
+    await rest.put(route, { body: commands });
+    console.log(`${commandScope} slash commands registered successfully.`);
   } catch (err) {
     console.error("Error registering commands:", err);
   }

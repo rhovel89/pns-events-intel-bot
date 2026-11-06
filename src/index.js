@@ -382,7 +382,8 @@ async function remindersTick() {
     for (const row of res.rows) {
       const ch = await fetchTextChannel(row.guild_id, row.channel_id);
       if (!ch) {
-        await pool.query(`UPDATE event_reminders SET fired=TRUE WHERE id=$1`, [row.reminder_id]);
+        // Do not silently discard a reminder if the channel is temporarily inaccessible.
+        console.warn(`Reminder ${row.reminder_id} cannot access channel ${row.channel_id}`);
         continue;
       }
 
@@ -426,6 +427,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const group = interaction.options.getSubcommandGroup(false);
     const sub = interaction.options.getSubcommand();
+    // Prevent cross-guild channel injection, including on edits.
+    const selectedChannel = interaction.options.getChannel("channel");
+    if (selectedChannel && selectedChannel.guildId !== guildId) {
+      return interaction.reply({ content: "Channel must belong to this server.", ephemeral: true });
+    }
 
     // ===== RECURRING GROUP =====
     if (group === "recurring") {
@@ -473,32 +479,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (sub === "list") {
-  // Prevent "application did not respond" if DB takes >3s
-  await interaction.deferReply({ ephemeral: true });
-
-  try {
-    const rows = await listActiveEvents(guildId);
-
-    if (!rows.length) {
-      return interaction.editReply({ content: "No active events." });
-    }
-
-    const lines = rows.map(e => {
-      // start_ts may come back as a string from Postgres
-      const ts = Number(e.start_ts);
-      const when = Number.isFinite(ts) ? fmtStartBoth(ts) : "**Invalid time**";
-      return `**#${e.id}** • **${e.name}** • ${when} • mention=${e.mention || "none"}`;
-    });
-
-    // Discord has message length limits; keep it safe
-    const msg = lines.join("\n").slice(0, 1900);
-    return interaction.editReply({ content: msg });
-  } catch (e) {
-    console.error("List command failed:", e);
-    return interaction.editReply({ content: `Error: ${e.message || "Unknown error"}` });
-  }
-}
-
+        await interaction.deferReply({ ephemeral: true });
+        const rows = await listRecurringTemplates(guildId);
+        const lines = rows.map(r => `#${r.id} • ${r.name} • ${r.time_hhmm} (${r.tz}) • ${r.is_enabled ? "enabled" : "disabled"}`);
+        return interaction.editReply({ content: lines.length ? lines.join("\n").slice(0, 1900) : "No recurring templates." });
+      }
 
       if (sub === "disable" || sub === "enable") {
         if (requireManageGuild(interaction)) return;
@@ -514,52 +499,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      // ✅ FULLY IMPLEMENTED RECURRING EDIT (this is the fix)
-      if (sub === "list") {
-  await interaction.deferReply({ ephemeral: true });
-
-  try {
-    const rows = await listActiveEvents(guildId);
-
-    if (!rows.length) {
-      await interaction.editReply({ content: "No active events." });
-      return;
-    }
-
-    const lines = rows.map(e => {
-      const ts = Number(e.start_ts);
-      const when = Number.isFinite(ts) ? fmtStartBoth(ts) : "**Invalid time**";
-      return `**#${e.id}** • **${e.name}** • ${when} • mention=${e.mention || "none"}`;
-    });
-
-    // Chunk into <= 1900 char payloads (safe under 2000)
-    const chunks = [];
-    let buf = "";
-
-    for (const line of lines) {
-      if ((buf + line + "\n").length > 1900) {
-        chunks.push(buf.trimEnd());
-        buf = "";
+      if (sub === "edit") {
+        if (requireManageGuild(interaction)) return;
+        const templateId = interaction.options.getInteger("template_id", true);
+        const patch = {};
+        const name = interaction.options.getString("name");
+        const time = interaction.options.getString("time");
+        const zone = interaction.options.getString("time_zone");
+        const days = interaction.options.getString("repeat_days");
+        const weeks = interaction.options.getInteger("weeks_ahead");
+        const channel = interaction.options.getChannel("channel");
+        const notes = interaction.options.getString("notes");
+        const mention = interaction.options.getString("mention");
+        if (name !== null) patch.name = name;
+        if (time !== null) { parseHhMm(time); patch.time_hhmm = time; }
+        if (zone !== null) {
+          if (!DateTime.local().setZone(zone).isValid) throw new Error("Invalid IANA time zone");
+          patch.tz = zone;
+        }
+        if (days !== null) patch.repeat_days = normalizeRepeatDays(days);
+        if (weeks !== null) patch.weeks_ahead = weeks;
+        if (channel) patch.channel_id = channel.id;
+        if (notes !== null) patch.notes = notes;
+        if (mention !== null) patch.mention = normalizeMention(mention);
+        const result = await editRecurringTemplate(guildId, templateId, patch);
+        if (!result.updated) return interaction.reply({ content: "Template not found or no changes.", ephemeral: true });
+        if (interaction.options.getBoolean("apply_future")) {
+          await purgeTemplateEvents(guildId, templateId, nowMs(), false);
+          if (result.row.is_enabled) await generateTemplateEvents(result.row, DateTime.utc().toFormat("yyyy-LL-dd"));
+        }
+        return interaction.reply({ content: `Updated recurring template #${templateId}.`, ephemeral: true });
       }
-      buf += line + "\n";
-    }
-    if (buf.trim()) chunks.push(buf.trimEnd());
-
-    // First chunk edits the deferred reply
-    await interaction.editReply({ content: chunks[0] });
-
-    // Remaining chunks as follow-ups
-    for (let i = 1; i < chunks.length; i++) {
-      await interaction.followUp({ content: chunks[i], ephemeral: true });
-    }
-
-    return;
-  } catch (e) {
-    console.error("List command failed:", e);
-    await interaction.editReply({ content: `Error: ${e.message || "Unknown error"}` });
-    return;
-  }
-}
 
       if (sub === "purge") {
         if (requireManageGuild(interaction)) return;
@@ -631,6 +601,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // ===== ONE-TIME COMMANDS =====
 
     if (sub === "create") {
+      if (requireManageGuild(interaction)) return;
       const name = interaction.options.getString("name", true);
       const startRaw = interaction.options.getString("start", true);
       const tz = interaction.options.getString("time_zone") || "UTC";
