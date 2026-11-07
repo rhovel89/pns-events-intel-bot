@@ -41,6 +41,21 @@ const commands = [
     .addSubcommand(sc => sc.setName("support")
       .setDescription("Optional donation link — every bot feature stays free"))
 
+    // WEEKLY_SUPPORT_V1: administrator-enabled channel post, disabled by default.
+    .addSubcommand(sc => sc.setName("support-reminders")
+      .setDescription("Manage optional weekly support announcements for this server")
+      .addStringOption(o => o.setName("action")
+        .setDescription("View, enable or disable weekly announcements")
+        .setRequired(true)
+        .addChoices(
+          { name: "Status", value: "status" },
+          { name: "Enable", value: "enable" },
+          { name: "Disable", value: "disable" }
+        ))
+      .addChannelOption(o => o.setName("channel")
+        .setDescription("Required when enabling; weekly announcements go here")
+        .addChannelTypes(ChannelType.GuildText)))
+
     // ADMIN_DASHBOARD_V1: ephemeral administrator overview and read-only buttons.
     .addSubcommand(sc =>
       sc.setName("dashboard")

@@ -94,6 +94,22 @@ async function initDb(pool) {
     );
   `);
 
+  // WEEKLY_SUPPORT_V1: no legacy guild is opted in by default.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guild_support_reminders (
+      guild_id TEXT PRIMARY KEY,
+      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      channel_id TEXT,
+      next_due_ts BIGINT,
+      last_attempt_ts BIGINT,
+      last_sent_ts BIGINT,
+      last_message_id TEXT,
+      updated_ts BIGINT NOT NULL DEFAULT 0
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS guild_support_reminders_due_idx
+    ON guild_support_reminders (next_due_ts) WHERE enabled=TRUE;`);
+
   // Safety upgrades (in case tables existed older)
   // RELIABILITY_V1: support metadata edits on existing databases.
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_ts BIGINT;`);

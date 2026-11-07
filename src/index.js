@@ -16,6 +16,7 @@ const { randomUUID } = require("node:crypto");
 const { makePool, initDb } = require("./db");
 const { createCalendar } = require("./calendar");
 const { supportMessage } = require("./support"); // VOLUNTARY_SUPPORT_V1
+const weeklySupport = require("./weekly-support"); // WEEKLY_SUPPORT_V1
 const { anchorDay, recurrenceMatches } = require("./recurrence");
 
 const {
@@ -46,6 +47,8 @@ const client = new Client({
 
 let reminderInterval = null;
 let recurringInterval = null;
+let weeklySupportInterval = null;
+let weeklySupportTickBusy = false;
 
 function nowMs() {
   return Date.now();
@@ -695,6 +698,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ ...supportMessage(), ephemeral: true });
     }
 
+    // WEEKLY_SUPPORT_V1: admin-only, explicit per-guild opt-in.
+    if (sub === "support-reminders") {
+      if (requireManageGuild(interaction)) return;
+      const action = interaction.options.getString("action", true);
+      if (action === "status") {
+        const cfg = await weeklySupport.settings(pool, guildId);
+        const due = cfg.next_due_ts ? `Next post: <t:${Math.floor(Number(cfg.next_due_ts) / 1000)}:F>` : "No post scheduled.";
+        return interaction.reply({ content:
+          `Weekly support announcements: **${cfg.enabled ? "ENABLED" : "DISABLED"}**. ` +
+          `${cfg.channel_id ? `Channel: <#${cfg.channel_id}>. ` : ""}${due} Donations are always optional; every feature remains free.`,
+          ephemeral: true, allowedMentions: { parse: [] } });
+      }
+      if (action === "disable") {
+        await weeklySupport.disable(pool, guildId);
+        return interaction.reply({ content: "✅ Weekly support announcements disabled for this server. The `/event support` command remains available.", ephemeral: true });
+      }
+      if (action === "enable") {
+        const channel = interaction.options.getChannel("channel");
+        if (!channel) return interaction.reply({ content: "Select the text channel in which weekly support announcements may appear.", ephemeral: true });
+        const usable = await fetchTextChannel(guildId, channel.id);
+        if (!usable || typeof usable.send !== "function" || usable.isDMBased?.()) {
+          return interaction.reply({ content: "I cannot post in that server text channel. Check bot permissions and try again.", ephemeral: true });
+        }
+        const me = interaction.guild?.members?.me || await interaction.guild?.members?.fetchMe?.();
+        const permissions = usable.permissionsFor?.(me);
+        if (!permissions?.has(PermissionsBitField.Flags.SendMessages) ||
+            !permissions?.has(PermissionsBitField.Flags.EmbedLinks)) {
+          return interaction.reply({ content: "Bot needs Send Messages and Embed Links permissions in that channel.", ephemeral: true });
+        }
+        const next = await weeklySupport.enable(pool, guildId, channel.id);
+        return interaction.reply({ content: `✅ Opted in! First optional donation announcement will appear in <#${channel.id}> <t:${Math.floor(next / 1000)}:R>, then at most once every seven days. Disable anytime with \`/event support-reminders action:Disable\`.`, ephemeral: true, allowedMentions: { parse: [] } });
+      }
+      return interaction.reply({ content: "Unknown action. Use Status, Enable or Disable.", ephemeral: true });
+    }
+
     // CALENDAR_V1: no Manage Server privilege needed for read-only views.
     if (sub === "calendar") {
       await interaction.deferReply({ ephemeral: true });
@@ -1132,6 +1170,16 @@ client.once(Events.ClientReady, async () => {
 
   if (!reminderInterval) reminderInterval = setInterval(remindersTick, 15 * 1000);
   if (!recurringInterval) recurringInterval = setInterval(recurringTick, 10 * 60 * 1000);
+  // WEEKLY_SUPPORT_V1: no posts unless a server administrator opts in.
+  const safeWeeklyTick = async () => {
+    if (weeklySupportTickBusy) return;
+    weeklySupportTickBusy = true;
+    try { await weeklySupport.weeklySupportTick(pool, fetchTextChannel); }
+    catch (err) { console.error("Weekly support tick failed:", err); }
+    finally { weeklySupportTickBusy = false; }
+  };
+  if (!weeklySupportInterval) weeklySupportInterval = setInterval(safeWeeklyTick, 60 * 1000);
+  void safeWeeklyTick();
 
   console.log("Schedulers started.");
 });
