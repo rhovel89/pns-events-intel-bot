@@ -15,6 +15,7 @@ const { DateTime } = require("luxon");
 const { randomUUID } = require("node:crypto");
 const { makePool, initDb } = require("./db");
 const { createCalendar } = require("./calendar");
+const { supportMessage } = require("./support"); // VOLUNTARY_SUPPORT_V1
 const { anchorDay, recurrenceMatches } = require("./recurrence");
 
 const {
@@ -689,6 +690,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "Channel must belong to this server.", ephemeral: true });
     }
 
+    // VOLUNTARY_SUPPORT_V1: voluntary tips only; free access remains unchanged.
+    if (sub === "support") {
+      return interaction.reply({ ...supportMessage(), ephemeral: true });
+    }
+
     // CALENDAR_V1: no Manage Server privilege needed for read-only views.
     if (sub === "calendar") {
       await interaction.deferReply({ ephemeral: true });
@@ -714,6 +720,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           "`/event setup` — view this server's time zone and default reminder channel",
           "`/event setup time_zone:America/Chicago channel:#reminders` — save server defaults (Manage Server required)",
           "`/event calendar` — private interactive day, week or month calendar (all members)",
+          "`/event support` — optional donation link; all bot features remain free",
           "`/event quick` — create an event using separate date and time fields",
           "`/event create` — advanced event with custom start/time zone",
           "`/event list`, `/event edit`, `/event end` — manage one-time events",

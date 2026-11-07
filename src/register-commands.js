@@ -37,6 +37,10 @@ const commands = [
         .addStringOption(o => o.setName("date").setDescription("Optional YYYY-MM-DD; defaults to today"))
     )
 
+    // VOLUNTARY_SUPPORT_V1: private support link, available to every member.
+    .addSubcommand(sc => sc.setName("support")
+      .setDescription("Optional donation link — every bot feature stays free"))
+
     // ADMIN_DASHBOARD_V1: ephemeral administrator overview and read-only buttons.
     .addSubcommand(sc =>
       sc.setName("dashboard")
