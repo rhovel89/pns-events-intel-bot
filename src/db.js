@@ -110,6 +110,27 @@ async function initDb(pool) {
   await pool.query(`CREATE INDEX IF NOT EXISTS guild_support_reminders_due_idx
     ON guild_support_reminders (next_due_ts) WHERE enabled=TRUE;`);
 
+  // CUSTOM_REMINDERS_V25: isolated standalone reminders, including due/claim metadata.
+  await pool.query(`CREATE TABLE IF NOT EXISTS standalone_reminders (
+    id BIGSERIAL PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    message TEXT NOT NULL, run_at_ts BIGINT NOT NULL, offsets INT[] NOT NULL,
+    created_by TEXT NOT NULL, created_ts BIGINT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active', updated_ts BIGINT
+  );`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS standalone_reminders_guild_idx
+    ON standalone_reminders(guild_id,run_at_ts) WHERE status='active';`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS standalone_reminder_deliveries (
+    id BIGSERIAL PRIMARY KEY, reminder_id BIGINT NOT NULL REFERENCES standalone_reminders(id) ON DELETE CASCADE,
+    minutes_before INT NOT NULL, due_ts BIGINT NOT NULL, attempts INT NOT NULL DEFAULT 0,
+    claim_token TEXT, claim_until BIGINT, next_attempt_ts BIGINT,
+    last_error TEXT, sent_at BIGINT, sent_message_id TEXT,
+    UNIQUE(reminder_id,minutes_before)
+  );`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS standalone_deliveries_due_idx
+    ON standalone_reminder_deliveries(due_ts,next_attempt_ts) WHERE sent_at IS NULL;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS reminder_offsets INT[];`);
+  await pool.query(`ALTER TABLE recurring_templates ADD COLUMN IF NOT EXISTS reminder_offsets INT[];`);
+
   // Safety upgrades (in case tables existed older)
   // RELIABILITY_V1: support metadata edits on existing databases.
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS updated_ts BIGINT;`);

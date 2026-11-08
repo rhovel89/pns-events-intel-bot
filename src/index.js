@@ -16,6 +16,8 @@ const { randomUUID } = require("node:crypto");
 const { makePool, initDb } = require("./db");
 const { createCalendar } = require("./calendar");
 const { supportMessage } = require("./support"); // VOLUNTARY_SUPPORT_V1
+const standalone = require("./standalone-reminders");
+const { readChoices, offsetsFromRow, OPTION_NAMES, LEGACY } = require("./reminder-options");
 const weeklySupport = require("./weekly-support"); // WEEKLY_SUPPORT_V1
 const { anchorDay, recurrenceMatches } = require("./recurrence");
 
@@ -45,6 +47,15 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
+let standaloneInterval = null;
+let standaloneTickBusy = false;
+async function safeStandaloneTick() {
+  if (standaloneTickBusy) return;
+  standaloneTickBusy=true;
+  try { await standalone.tick(pool,fetchTextChannel); }
+  catch(e){console.error("Standalone reminder tick failed:",e)}
+  finally {standaloneTickBusy=false;}
+}
 let reminderInterval = null;
 let recurringInterval = null;
 let weeklySupportInterval = null;
@@ -125,6 +136,7 @@ async function createEventReminders(eventId, startTs, remindersArr, db = pool) {
 }
 
 async function createOneTimeEvent({
+  reminderOffsets = null,
   guildId,
   channelId,
   name,
@@ -138,8 +150,8 @@ async function createOneTimeEvent({
   const createdTs = nowMs();
 
   const res = await db.query(
-    `INSERT INTO events (guild_id, channel_id, name, start_ts, notes, is_active, created_by, created_ts, mention, recurring_template_id)
-     VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9)
+    `INSERT INTO events (guild_id, channel_id, name, start_ts, notes, is_active, created_by, created_ts, mention, recurring_template_id, reminder_offsets)
+     VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10::int[])
      ON CONFLICT (recurring_template_id, start_ts) WHERE recurring_template_id IS NOT NULL DO NOTHING
      RETURNING id`,
     [
@@ -151,13 +163,14 @@ async function createOneTimeEvent({
       createdBy ?? null,
       createdTs,
       mention ?? "none",
-      recurringTemplateId
+      recurringTemplateId,
+      reminderOffsets
     ]
   );
 
   if (!res.rowCount) return null; // Already generated occurrence; do not duplicate reminders.
   const eventId = res.rows[0].id;
-  const reminders = parseReminders();
+  const reminders = offsetsFromRow(reminderOffsets, parseReminders());
   await createEventReminders(eventId, startTs, reminders, db);
   return eventId;
 }
@@ -187,7 +200,7 @@ async function endEvent(guildId, eventId) {
 
 // RELIABILITY_V1: atomic per-event edit and pending reminder reschedule.
 async function editEvent(guildId, eventId, patch) {
-  const allowed = ["name", "start_ts", "notes", "mention", "channel_id"];
+  const allowed = ["name", "start_ts", "notes", "mention", "channel_id", "reminder_offsets"];
   const fields = allowed.filter(k => patch[k] !== undefined);
   if (!fields.length) return { updated: false, row: null, rescheduled: false };
   const db = await pool.connect();
@@ -211,14 +224,15 @@ async function editEvent(guildId, eventId, patch) {
     const res = await db.query(
       `UPDATE events SET ${assignments.join(", ")}, updated_ts=$${i+1}
        WHERE guild_id=$${i+2} AND id=$${i+3} AND is_active=TRUE
-       RETURNING id, name, start_ts, notes, mention, channel_id`, values
+       RETURNING id, name, start_ts, notes, mention, channel_id, reminder_offsets`, values
     );
-    const rescheduled = patch.start_ts !== undefined &&
-      Number(patch.start_ts) !== Number(original.rows[0].start_ts);
+    const rescheduled = (patch.start_ts !== undefined &&
+      Number(patch.start_ts) !== Number(original.rows[0].start_ts)) || patch.reminder_offsets !== undefined;
     if (rescheduled) {
       await db.query(`DELETE FROM event_reminders WHERE event_id=$1 AND fired=FALSE`, [eventId]);
-      const times = [...new Set(parseReminders().map(minutes =>
-        Number(patch.start_ts) - minutes * 60000).filter(ts => ts > nowMs()))];
+      const offsets = offsetsFromRow(res.rows[0].reminder_offsets, parseReminders());
+      const times = [...new Set(offsets.map(minutes =>
+        Number(res.rows[0].start_ts) - minutes * 60000).filter(ts => ts > nowMs()))];
       for (const ts of times) {
         await db.query(`INSERT INTO event_reminders (event_id, remind_at_ts, fired)
           VALUES ($1,$2,FALSE)`, [eventId, ts]);
@@ -249,14 +263,15 @@ async function createRecurringTemplate({
   mention,
   createdBy,
   intervalWeeks = 1,
-  anchorDate
+  anchorDate,
+  reminderOffsets = null
 }) {
   const createdTs = nowMs();
 
   const res = await pool.query(
     `INSERT INTO recurring_templates
-     (guild_id, channel_id, name, tz, time_hhmm, repeat_days, notes, reminders, weeks_ahead, is_enabled, mention, created_by, created_ts, interval_weeks, anchor_date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11,$12,$13,$14::date)
+     (guild_id, channel_id, name, tz, time_hhmm, repeat_days, notes, reminders, weeks_ahead, is_enabled, mention, created_by, created_ts, interval_weeks, anchor_date, reminder_offsets)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11,$12,$13,$14::date,$15::int[])
      RETURNING id`,
     [
       guildId,
@@ -272,7 +287,8 @@ async function createRecurringTemplate({
       createdBy ?? null,
       createdTs,
       intervalWeeks,
-      anchorDate
+      anchorDate,
+      reminderOffsets
     ]
   );
 
@@ -308,7 +324,7 @@ async function editRecurringTemplate(guildId, templateId, patch, db = pool) {
   const values = [];
   let i = 1;
 
-  const allowed = ["name", "tz", "time_hhmm", "repeat_days", "weeks_ahead", "notes", "mention", "channel_id", "interval_weeks", "anchor_date"];
+  const allowed = ["name", "tz", "time_hhmm", "repeat_days", "weeks_ahead", "notes", "mention", "channel_id", "interval_weeks", "anchor_date", "reminder_offsets"];
   for (const k of allowed) {
     if (patch[k] === undefined) continue;
     fields.push(`${k}=$${i++}`);
@@ -377,6 +393,7 @@ async function generateTemplateEvents(template, anchorDateStr, db = pool) {
         mention: template.mention || "none",
         createdBy: template.created_by,
         recurringTemplateId: template.id,
+        reminderOffsets: template.reminder_offsets,
         db
       });
       if (eventId !== null) inserted += 1;
@@ -803,6 +820,75 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
+    // REMINDER_CENTER_V25: Independent alliance message, never a calendar event.
+    if (group === "reminder") {
+      if (requireManageGuild(interaction)) return;
+      if (sub === "create") {
+        const message=interaction.options.getString("message",true);
+        const when=interaction.options.getString("when",true);
+        const { tz, channelId } = await chooseGuildDefaults(guildId,interaction);
+        const startNow=nowMs();
+        let runAt;
+        if (when==="now") runAt=startNow;
+        else if (when==="in5") runAt=startNow+5*60000;
+        else if (when==="at") {
+          const date=interaction.options.getString("date");
+          const time=interaction.options.getString("time");
+          if (!date || !time) throw new Error("Specify both date and time when choosing At date and time.");
+          parseHhMm(time);
+          runAt=parseStartToUtcMillis({startRaw:`${date} ${time}`,timeZone:tz});
+        } else throw new Error("Unknown reminder timing.");
+        let offsets=readChoices(interaction.options,[0]);
+        if (when==="now") {
+          if (offsets.some(x=>x!==0)) throw new Error("Immediate reminders cannot have earlier warning messages.");
+          offsets=[0];
+        }
+        const item=await standalone.create(pool,{guildId,channelId,message,runAt,offsets,createdBy:interaction.user.id},startNow);
+        if (when==="now") void safeStandaloneTick();
+        return interaction.reply({content:`🔔 Scheduled standalone reminder #${item.id} in <#${channelId}> for <t:${Math.floor(runAt/1000)}:F>. ${item.count} delivery message(s) queued.`,ephemeral:true,allowedMentions:{parse:[]}});
+      }
+      if (sub==="edit") {
+        const id=interaction.options.getInteger("reminder_id",true);
+        const message=interaction.options.getString("message");
+        const when=interaction.options.getString("when");
+        const date=interaction.options.getString("date");
+        const time=interaction.options.getString("time");
+        const changes={};
+        if (message!==null) changes.message=message;
+        if (when!==null) {
+          if (when==="now") changes.runAt=nowMs();
+          else if (when==="in5") changes.runAt=nowMs()+5*60000;
+          else if (when==="at") {
+            if(!date || !time) throw new Error("Specify date and time when rescheduling At date and time.");
+            parseHhMm(time);
+            const cfg=await getGuildSettings(guildId);
+            changes.runAt=parseStartToUtcMillis({startRaw:`${date} ${time}`,timeZone:cfg.time_zone});
+          } else throw new Error("Unknown reminder timing.");
+        }else if (date!==null || time!==null) throw new Error("Select when:At date and time to change the date or time.");
+        if (OPTION_NAMES.some(([,name])=>interaction.options.getBoolean(name)!==null))
+          changes.offsets=readChoices(interaction.options,[]);
+        if (when==="now") {
+          if (changes.offsets?.some(x=>x!==0)) throw new Error("Immediate reminders cannot have pre-warnings.");
+          changes.offsets=[0];
+        }
+        const result=await standalone.edit(pool,guildId,id,changes);
+        if (when==="now" && result.updated) void safeStandaloneTick();
+        return interaction.reply({content:result.updated?
+          `✅ Updated standalone reminder #${id}; ${result.count} pending delivery message(s) now scheduled.`:
+          `Reminder #${id} not found or already cancelled.`,ephemeral:true});
+      }
+      if (sub==="list") {
+        const entries=await standalone.list(pool,guildId);
+        return interaction.reply({content:entries.length?entries.map(x=>`#${x.id} • <t:${Math.floor(Number(x.run_at_ts)/1000)}:F> • <#${x.channel_id}> • ${safeTruncate(x.message,85)}`).join("\n"):"No active standalone reminders.",ephemeral:true,allowedMentions:{parse:[]}});
+      }
+      if (sub==="cancel") {
+        const id=interaction.options.getInteger("reminder_id",true);
+        const ok=await standalone.cancel(pool,guildId,id);
+        return interaction.reply({content:ok?`✅ Cancelled standalone reminder #${id}.`:`Reminder #${id} not found or already cancelled.`,ephemeral:true});
+      }
+      return interaction.reply({content:"Unknown standalone reminder command.",ephemeral:true});
+    }
+
     if (sub === "quick") {
       if (requireManageGuild(interaction)) return;
       const name = interaction.options.getString("name", true);
@@ -815,7 +901,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const notes = interaction.options.getString("notes");
       const mention = "none"; // Safe default; explicit mentions remain in advanced create.
       const eventId = await createOneTimeEvent({
-        guildId, channelId, name, startTs, notes, mention, createdBy: interaction.user.id
+        guildId, channelId, name, startTs, notes, mention, createdBy: interaction.user.id,
+        reminderOffsets: readChoices(interaction.options, parseReminders())
       });
       const ch = await fetchTextChannel(guildId, channelId);
       const embed = new EmbedBuilder()
@@ -866,7 +953,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           mention,
           createdBy: interaction.user.id,
           intervalWeeks,
-          anchorDate: validatedAnchor
+          anchorDate: validatedAnchor,
+          reminderOffsets: readChoices(interaction.options)
         });
 
         const tRes = await pool.query(`SELECT * FROM recurring_templates WHERE id=$1`, [templateId]);
@@ -903,6 +991,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (requireManageGuild(interaction)) return;
         const templateId = interaction.options.getInteger("template_id", true);
         const patch = {};
+        if (OPTION_NAMES.some(([,name])=>interaction.options.getBoolean(name)!==null))
+          patch.reminder_offsets=readChoices(interaction.options,[]);
         const name = interaction.options.getString("name");
         const time = interaction.options.getString("time");
         const zone = interaction.options.getString("time_zone");
@@ -944,7 +1034,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (notes !== null) patch.notes = notes;
         if (mention !== null) patch.mention = normalizeMention(mention);
         const applyFuture = interaction.options.getBoolean("apply_future") === true;
-        if ((patch.interval_weeks !== undefined || patch.anchor_date !== undefined) && !applyFuture)
+        if ((patch.interval_weeks !== undefined || patch.anchor_date !== undefined || patch.reminder_offsets !== undefined) && !applyFuture)
           throw new Error(`Changing the frequency or anchor requires apply_future:true with confirm:APPLY ${templateId} so generated occurrences stay consistent.`);
         if (applyFuture && interaction.options.getString("confirm") !== `APPLY ${templateId}`) {
           throw new Error(`Nothing changed. Set confirm to APPLY ${templateId} before regenerating future events.`);
@@ -1071,6 +1161,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const startTs = parseStartToUtcMillis({ startRaw, timeZone: tz });
 
       const eventId = await createOneTimeEvent({
+        reminderOffsets: readChoices(interaction.options, parseReminders()),
         guildId,
         channelId,
         name,
@@ -1134,6 +1225,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (notes !== null && notes !== undefined) patch.notes = notes;
       if (mention) patch.mention = normalizeMention(mention);
 
+      if (OPTION_NAMES.some(([,name])=>interaction.options.getBoolean(name)!==null))
+        patch.reminder_offsets=readChoices(interaction.options,[]);
       const result = await editEvent(guildId, eventId, patch);
       if (!result.updated) return interaction.reply({ content: "Event not found or no changes.", ephemeral: true });
 
@@ -1169,6 +1262,8 @@ client.once(Events.ClientReady, async () => {
   }
 
   if (!reminderInterval) reminderInterval = setInterval(remindersTick, 15 * 1000);
+  if (!standaloneInterval) standaloneInterval=setInterval(safeStandaloneTick,15*1000);
+  void safeStandaloneTick();
   if (!recurringInterval) recurringInterval = setInterval(recurringTick, 10 * 60 * 1000);
   // WEEKLY_SUPPORT_V1: no posts unless a server administrator opts in.
   const safeWeeklyTick = async () => {

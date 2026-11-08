@@ -1,5 +1,6 @@
 require("dotenv").config();
 const { REST, Routes, SlashCommandBuilder, ChannelType } = require("discord.js");
+const { addChoiceOptions } = require("./reminder-options");
 
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -74,6 +75,29 @@ const commands = [
         .addChannelOption(o => o.setName("channel").setDescription("Default reminder channel").addChannelTypes(ChannelType.GuildText))
     )
 
+    // Standalone, alliance-scoped reminders (not associated with event calendar).
+    .addSubcommandGroup(g => g.setName("reminder")
+      .setDescription("Standalone alliance reminders")
+      .addSubcommand(sc => addChoiceOptions(sc.setName("create")
+        .setDescription("Send now, in 5 minutes, or at a chosen date/time")
+        .addStringOption(o=>o.setName("message").setDescription("Reminder text (1-1500 characters)").setRequired(true))
+        .addStringOption(o=>o.setName("when").setDescription("Delivery timing").setRequired(true)
+          .addChoices({name:"Immediately",value:"now"}, {name:"In 5 minutes",value:"in5"}, {name:"At date and time",value:"at"}))
+        .addStringOption(o=>o.setName("date").setDescription("For at: YYYY-MM-DD"))
+        .addStringOption(o=>o.setName("time").setDescription("For at: HH:mm (24-hour)"))
+        .addChannelOption(o=>o.setName("channel").setDescription("Target text channel").addChannelTypes(ChannelType.GuildText))))
+      .addSubcommand(sc=>addChoiceOptions(sc.setName("edit")
+        .setDescription("Edit unsent standalone reminder deliveries")
+        .addIntegerOption(o=>o.setName("reminder_id").setDescription("Reminder ID").setRequired(true))
+        .addStringOption(o=>o.setName("message").setDescription("Replacement reminder text"))
+        .addStringOption(o=>o.setName("when").setDescription("Change delivery time")
+          .addChoices({name:"Immediately",value:"now"},{name:"In 5 minutes",value:"in5"},{name:"At date and time",value:"at"}))
+        .addStringOption(o=>o.setName("date").setDescription("For at: YYYY-MM-DD"))
+        .addStringOption(o=>o.setName("time").setDescription("For at: HH:mm"))))
+      .addSubcommand(sc=>sc.setName("list").setDescription("List this alliance's upcoming standalone reminders"))
+      .addSubcommand(sc=>sc.setName("cancel").setDescription("Cancel a standalone reminder")
+        .addIntegerOption(o=>o.setName("reminder_id").setDescription("Reminder ID").setRequired(true))))
+
     .addSubcommand(sc =>
       sc.setName("quick")
         .setDescription("Quick event: name, date, time; uses this server's defaults")
@@ -81,10 +105,16 @@ const commands = [
         .addStringOption(o => o.setName("date").setDescription("YYYY-MM-DD").setRequired(true))
         .addStringOption(o => o.setName("time").setDescription("HH:mm (24-hour) in server's time zone").setRequired(true))
         .addStringOption(o => o.setName("notes").setDescription("Optional notes"))
+        .addBooleanOption(o=>o.setName("alert_60").setDescription("1 hour before"))
+        .addBooleanOption(o=>o.setName("alert_45").setDescription("45 minutes before"))
+        .addBooleanOption(o=>o.setName("alert_30").setDescription("30 minutes before"))
+        .addBooleanOption(o=>o.setName("alert_15").setDescription("15 minutes before"))
+        .addBooleanOption(o=>o.setName("alert_5").setDescription("5 minutes before"))
+        .addBooleanOption(o=>o.setName("alert_at_time").setDescription("At event start"))
     )
 
     // One-time event create
-    .addSubcommand(sc =>
+    .addSubcommand(sc => addChoiceOptions(
       sc.setName("create")
         .setDescription("Create a one-time event")
         // Required first
@@ -95,7 +125,7 @@ const commands = [
         .addChannelOption(o => o.setName("channel").setDescription("Where to post reminders (default: current channel)").addChannelTypes(ChannelType.GuildText).setRequired(false))
         .addStringOption(o => o.setName("notes").setDescription("Optional notes").setRequired(false))
         .addStringOption(o => o.setName("mention").setDescription("Mention when reminders fire").setRequired(false).addChoices(...mentionChoices))
-    )
+    ))
 
     .addSubcommand(sc =>
       sc.setName("list")
@@ -108,7 +138,7 @@ const commands = [
         .addIntegerOption(o => o.setName("event_id").setDescription("Event ID").setRequired(true))
     )
 
-    .addSubcommand(sc =>
+    .addSubcommand(sc => addChoiceOptions(
       sc.setName("edit")
         .setDescription("Edit an event")
         .addIntegerOption(o => o.setName("event_id").setDescription("Event ID").setRequired(true))
@@ -118,14 +148,14 @@ const commands = [
         .addChannelOption(o => o.setName("channel").setDescription("New channel for reminders").addChannelTypes(ChannelType.GuildText).setRequired(false))
         .addStringOption(o => o.setName("notes").setDescription("Replace notes").setRequired(false))
         .addStringOption(o => o.setName("mention").setDescription("Change mention").setRequired(false).addChoices(...mentionChoices))
-    )
+    ))
 
     // Recurring (as a subcommand group)
     .addSubcommandGroup(g =>
       g.setName("recurring")
         .setDescription("Create/manage recurring event templates (bulk operations included)")
 
-        .addSubcommand(sc =>
+        .addSubcommand(sc => addChoiceOptions(
           sc.setName("create")
             .setDescription("Create a recurring template and generate occurrences")
             // Required first
@@ -141,14 +171,14 @@ const commands = [
             .addChannelOption(o => o.setName("channel").setDescription("Where to post reminders (default: current channel)").addChannelTypes(ChannelType.GuildText).setRequired(false))
             .addStringOption(o => o.setName("notes").setDescription("Optional series notes").setRequired(false))
             .addStringOption(o => o.setName("mention").setDescription("Mention on reminders").setRequired(false).addChoices(...mentionChoices))
-        )
+        ))
 
         .addSubcommand(sc =>
           sc.setName("list")
             .setDescription("List recurring templates")
         )
 
-        .addSubcommand(sc =>
+        .addSubcommand(sc => addChoiceOptions(
           sc.setName("edit")
             .setDescription("Edit a recurring template")
             .addIntegerOption(o => o.setName("template_id").setDescription("Template ID").setRequired(true))
@@ -165,7 +195,7 @@ const commands = [
             .addStringOption(o => o.setName("mention").setDescription("Change mention").setRequired(false).addChoices(...mentionChoices))
             .addBooleanOption(o => o.setName("apply_future").setDescription("If true, purge future and regenerate with new settings").setRequired(false))
             .addStringOption(o => o.setName("confirm").setDescription("For apply_future: type APPLY <template_id>").setRequired(false))
-        )
+        ))
 
         .addSubcommand(sc =>
           sc.setName("disable")
