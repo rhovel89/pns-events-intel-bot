@@ -10,6 +10,7 @@ const {
 
 const { DateTime } = require("luxon");
 const { makePool, initDb } = require("./db");
+const { createWkOutboxDispatcher } = require("./wk-outbox-dispatcher");
 
 const {
   parseReminders,
@@ -39,6 +40,7 @@ const client = new Client({
 
 let reminderInterval = null;
 let recurringInterval = null;
+let wkOutboxInterval = null;
 
 function nowMs() {
   return Date.now();
