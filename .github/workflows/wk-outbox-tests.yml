@@ -1,0 +1,28 @@
+name: WK Outbox Worker Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/wk-outbox-dispatcher.js'
+      - 'tests/wk-outbox-dispatcher.test.js'
+      - '.github/workflows/wk-outbox-tests.yml'
+      - 'src/index.js'
+  push:
+    branches: [feature/wk-outbox-reuse-existing-bot]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --check src/wk-outbox-dispatcher.js
+      - run: node --check src/index.js
+      - run: node --test tests/wk-outbox-dispatcher.test.js
