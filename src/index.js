@@ -744,6 +744,15 @@ client.once(Events.ClientReady, async () => {
   if (!reminderInterval) reminderInterval = setInterval(remindersTick, 15 * 1000);
   if (!recurringInterval) recurringInterval = setInterval(recurringTick, 10 * 60 * 1000);
 
+  // Optional WK dispatch shares this existing bot process and Discord client.
+  // It remains inert until the three WK_* environment variables are configured.
+  const wkDispatcher = createWkOutboxDispatcher({ client });
+  if (!wkOutboxInterval && process.env.WK_SUPABASE_URL && process.env.WK_SUPABASE_SERVICE_ROLE_KEY && process.env.WK_DISCORD_CHANNEL_ID) {
+    wkOutboxInterval = setInterval(() => wkDispatcher.dispatch().catch(e => console.error("WK outbox error:", e)), 5 * 60 * 1000);
+    wkDispatcher.dispatch().catch(e => console.error("WK outbox startup error:", e));
+    console.log("Optional WK outbox scheduler started.");
+  }
+
   console.log("Schedulers started.");
 });
 
