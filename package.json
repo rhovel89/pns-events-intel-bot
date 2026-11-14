@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "register": "node src/register-commands.js"
+    "register": "node src/register-commands.js",
+    "test": "node --test"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
